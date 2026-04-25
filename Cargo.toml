@@ -1,0 +1,11 @@
+[package]
+name = "ascompiler"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "asc"
+path = "src/main.rs"
+
+[dependencies]
+inkwell = { version = "0.8", features = ["llvm20-1", "target-aarch64"] }

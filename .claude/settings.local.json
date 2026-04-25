@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "WebFetch(domain:crates.io)",
+      "Bash(cargo test:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo clippy:*)",
+      "mcp__rustrover__build_project",
+      "Bash(rustc -vV)",
+      "Read(//opt/homebrew/Cellar/llvm@20/20.1.8/lib/**)",
+      "Bash(./target/debug/asc test.as -o mytest)",
+      "Bash(./mytest)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(./target/debug/asc)",
+      "Bash(./target/debug/asc noexist.as)",
+      "Bash(./target/debug/asc noentry.as)",
+      "Bash(./target/debug/asc test.as --ir)",
+      "Bash(./target/debug/asc test.as)",
+      "Bash(./test)"
+    ]
+  }
+}
