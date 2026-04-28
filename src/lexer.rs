@@ -18,6 +18,9 @@ pub enum Token {
 
     // Control flow
     ReturnKw, // 返回
+    If,       // 判断
+    ElseIf,   // 若
+    Else,     // 否则
 
     // Types
     VoidKw,    // 无
@@ -40,17 +43,32 @@ pub enum Token {
     Execute, // 执行
 
     // Symbols (bilingual: Chinese and English)
-    LParen,   // ( or （
-    RParen,   // ) or ）
-    Colon,    // : or ：
-    ScopeEnd, // .. or 。。
-    Comma,    // , or ，
-    Equals,   // =
+    LParen,    // ( or （
+    RParen,    // ) or ）
+    Colon,     // : or ：
+    ScopeEnd,  // .. or 。。
+    Comma,     // , or ，
+    Equals,    // =
+    Plus,      // +
+    Minus,     // -
+    Star,      // *
+    Slash,     // /
+    Percent,   // %
+    EqEq,      // ==
+    NotEq,     // !=
+    Less,      // <
+    LessEq,    // <=
+    Greater,   // >
+    GreaterEq, // >=
+    AndAnd,    // &&
+    OrOr,      // ||
+    Bang,      // !
 
     // Values
     Ident(String),
     IntLiteral(i64),
     StringLiteral(String),
+    FormattedStringLiteral(String),
 
     // Special
     Eof,
@@ -139,6 +157,8 @@ impl Lexer {
                     ['方', '法'] => Some(Token::Method),
                     ['模', '块'] => Some(Token::Module),
                     ['返', '回'] => Some(Token::ReturnKw),
+                    ['判', '断'] => Some(Token::If),
+                    ['否', '则'] => Some(Token::Else),
                     ['引', '用'] => Some(Token::Import),
                     ['执', '行'] => Some(Token::Execute),
                     ['整', '数'] => Some(Token::IntKw),
@@ -172,6 +192,18 @@ impl Lexer {
         if ch1 == '为' {
             self.advance();
             return Some(Token::AsKw);
+        }
+        if ch1 == '若' {
+            self.advance();
+            return Some(Token::ElseIf);
+        }
+        if ch1 == '且' {
+            self.advance();
+            return Some(Token::AndAnd);
+        }
+        if ch1 == '或' {
+            self.advance();
+            return Some(Token::OrOr);
         }
 
         None
@@ -210,6 +242,8 @@ impl Lexer {
                         | ['方', '法']
                         | ['模', '块']
                         | ['返', '回']
+                        | ['判', '断']
+                        | ['否', '则']
                         | ['引', '用']
                         | ['执', '行']
                         | ['整', '数']
@@ -226,7 +260,7 @@ impl Lexer {
         }
 
         // Check 1-char keyword
-        ch1 == '无' || ch1 == '设' || ch1 == '为'
+        ch1 == '无' || ch1 == '设' || ch1 == '为' || ch1 == '若' || ch1 == '且' || ch1 == '或'
     }
 
     /// Read an integer literal starting at the current position.
@@ -259,6 +293,18 @@ impl Lexer {
         Err("Unterminated string literal".to_string())
     }
 
+    /// Read an f-string literal after the leading `f`.
+    fn read_formatted_string(&mut self, quote: char, closing: char) -> Result<Token, String> {
+        self.advance();
+        if self.current() != Some(quote) {
+            return Err("Expected quote after f-string prefix".to_string());
+        }
+        match self.read_string(closing)? {
+            Token::StringLiteral(value) => Ok(Token::FormattedStringLiteral(value)),
+            _ => unreachable!(),
+        }
+    }
+
     /// Read an identifier starting at the current position.
     /// Stops at whitespace, symbols, or when a new keyword begins.
     fn read_identifier(&mut self) -> String {
@@ -270,9 +316,39 @@ impl Lexer {
             // Stop at any symbol character
             if matches!(
                 ch,
-                '@' | '(' | ')' | '（' | '）' | ':' | '：' | ',' | '，' | '.' | '。' | '='
+                '@' | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | ':'
+                    | '：'
+                    | ','
+                    | '，'
+                    | '.'
+                    | '。'
+                    | '='
+                    | '+'
+                    | '*'
+                    | '/'
+                    | '%'
+                    | '!'
+                    | '<'
+                    | '>'
+                    | '&'
+                    | '|'
             ) {
                 break;
+            }
+            if ch == '-' {
+                let prev_is_cjk = ident
+                    .chars()
+                    .last()
+                    .map(Self::is_cjk_ideograph)
+                    .unwrap_or(false);
+                let next_is_cjk = self.peek(1).map(Self::is_cjk_ideograph).unwrap_or(false);
+                if !prev_is_cjk || !next_is_cjk {
+                    break;
+                }
             }
             // If a new identifier would start with a keyword, stop. Once an
             // identifier has started, keyword text may be part of the name.
@@ -295,6 +371,20 @@ impl Lexer {
         };
 
         match ch {
+            'f' if self.peek(1) == Some('"') => match self.read_formatted_string('"', '"') {
+                Ok(token) => token,
+                Err(msg) => {
+                    eprintln!("Warning: {}", msg);
+                    Token::Eof
+                }
+            },
+            'f' if self.peek(1) == Some('“') => match self.read_formatted_string('“', '”') {
+                Ok(token) => token,
+                Err(msg) => {
+                    eprintln!("Warning: {}", msg);
+                    Token::Eof
+                }
+            },
             '#' => {
                 self.advance();
                 Token::Hash
@@ -351,7 +441,79 @@ impl Lexer {
             }
             '=' => {
                 self.advance();
-                Token::Equals
+                if self.current() == Some('=') {
+                    self.advance();
+                    Token::EqEq
+                } else {
+                    Token::Equals
+                }
+            }
+            '+' => {
+                self.advance();
+                Token::Plus
+            }
+            '-' => {
+                self.advance();
+                Token::Minus
+            }
+            '*' => {
+                self.advance();
+                Token::Star
+            }
+            '/' => {
+                self.advance();
+                Token::Slash
+            }
+            '%' => {
+                self.advance();
+                Token::Percent
+            }
+            '!' => {
+                self.advance();
+                if self.current() == Some('=') {
+                    self.advance();
+                    Token::NotEq
+                } else {
+                    Token::Bang
+                }
+            }
+            '<' => {
+                self.advance();
+                if self.current() == Some('=') {
+                    self.advance();
+                    Token::LessEq
+                } else {
+                    Token::Less
+                }
+            }
+            '>' => {
+                self.advance();
+                if self.current() == Some('=') {
+                    self.advance();
+                    Token::GreaterEq
+                } else {
+                    Token::Greater
+                }
+            }
+            '&' => {
+                self.advance();
+                if self.current() == Some('&') {
+                    self.advance();
+                    Token::AndAnd
+                } else {
+                    eprintln!("Warning: unrecognized character: '&'");
+                    self.next_token()
+                }
+            }
+            '|' => {
+                self.advance();
+                if self.current() == Some('|') {
+                    self.advance();
+                    Token::OrOr
+                } else {
+                    eprintln!("Warning: unrecognized character: '|'");
+                    self.next_token()
+                }
             }
             _ => {
                 // Number literals
@@ -468,6 +630,52 @@ mod tests {
         assert_eq!(lexer.next_token(), Token::Ident("输出".to_string()));
         assert_eq!(lexer.next_token(), Token::Colon);
         assert_eq!(lexer.next_token(), Token::StringLiteral("你好".to_string()));
+    }
+
+    #[test]
+    fn test_formatted_string_literal() {
+        let source = "执行 输出：f“你好，{名字}”";
+        let mut lexer = Lexer::new(source);
+        assert_eq!(lexer.next_token(), Token::Execute);
+        assert_eq!(lexer.next_token(), Token::Ident("输出".to_string()));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(
+            lexer.next_token(),
+            Token::FormattedStringLiteral("你好，{名字}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_condition_keywords_and_cpp_operators() {
+        let source = "判断x>=10&&x!=20：若 y<3||!z：判断 a 且 b 或 c：否则：";
+        let mut lexer = Lexer::new(source);
+
+        assert_eq!(lexer.next_token(), Token::If);
+        assert_eq!(lexer.next_token(), Token::Ident("x".to_string()));
+        assert_eq!(lexer.next_token(), Token::GreaterEq);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(10));
+        assert_eq!(lexer.next_token(), Token::AndAnd);
+        assert_eq!(lexer.next_token(), Token::Ident("x".to_string()));
+        assert_eq!(lexer.next_token(), Token::NotEq);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(20));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::ElseIf);
+        assert_eq!(lexer.next_token(), Token::Ident("y".to_string()));
+        assert_eq!(lexer.next_token(), Token::Less);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(3));
+        assert_eq!(lexer.next_token(), Token::OrOr);
+        assert_eq!(lexer.next_token(), Token::Bang);
+        assert_eq!(lexer.next_token(), Token::Ident("z".to_string()));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::If);
+        assert_eq!(lexer.next_token(), Token::Ident("a".to_string()));
+        assert_eq!(lexer.next_token(), Token::AndAnd);
+        assert_eq!(lexer.next_token(), Token::Ident("b".to_string()));
+        assert_eq!(lexer.next_token(), Token::OrOr);
+        assert_eq!(lexer.next_token(), Token::Ident("c".to_string()));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::Else);
+        assert_eq!(lexer.next_token(), Token::Colon);
     }
 
     #[test]

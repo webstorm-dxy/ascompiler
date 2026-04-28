@@ -50,6 +50,7 @@ pub enum Stmt {
     VarDecl(VarDecl),
     Import(ImportDecl),
     Execute(ExecuteStmt),
+    If(IfStmt),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,9 +70,61 @@ pub struct VarDecl {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct IfStmt {
+    pub branches: Vec<IfBranch>,
+    pub else_body: Option<Vec<Stmt>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IfBranch {
+    pub condition: Expr,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLiteral(i64),
     StringLiteral(String),
+    FormattedString(Vec<FormatPart>),
+    Ident(String),
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        left: Box<Expr>,
+        op: BinaryOp,
+        right: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    NotEq,
+    Less,
+    LessEq,
+    Greater,
+    GreaterEq,
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormatPart {
+    Text(String),
+    Placeholder(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -353,12 +406,28 @@ impl Parser {
 
     /// Parse function body: statements until scope end.
     fn parse_body(&mut self) -> Result<Vec<Stmt>, String> {
+        self.parse_statements_until_scope_end()
+    }
+
+    fn parse_statements_until_scope_end(&mut self) -> Result<Vec<Stmt>, String> {
         let mut stmts = Vec::new();
         while self.current != Token::ScopeEnd && self.current != Token::Eof {
             let stmt = self.parse_stmt()?;
             stmts.push(stmt);
         }
         self.expect(&Token::ScopeEnd)?;
+        Ok(stmts)
+    }
+
+    fn parse_statements_until_if_boundary(&mut self) -> Result<Vec<Stmt>, String> {
+        let mut stmts = Vec::new();
+        while !matches!(
+            self.current,
+            Token::ElseIf | Token::Else | Token::ScopeEnd | Token::Eof
+        ) {
+            let stmt = self.parse_stmt()?;
+            stmts.push(stmt);
+        }
         Ok(stmts)
     }
 
@@ -369,8 +438,40 @@ impl Parser {
             Token::Let => self.parse_let_stmt().map(Stmt::VarDecl),
             Token::Import => self.parse_import_decl().map(Stmt::Import),
             Token::Execute => self.parse_execute_stmt().map(Stmt::Execute),
+            Token::If => self.parse_if_stmt().map(Stmt::If),
             other => Err(format!("Unexpected token {:?} in function body", other)),
         }
+    }
+
+    /// Parse `判断 condition：... [若 condition：...] [否则：...]。。`
+    fn parse_if_stmt(&mut self) -> Result<IfStmt, String> {
+        self.expect(&Token::If)?;
+        let condition = self.parse_expr()?;
+        self.expect(&Token::Colon)?;
+        let body = self.parse_statements_until_if_boundary()?;
+        let mut branches = vec![IfBranch { condition, body }];
+
+        while self.current == Token::ElseIf {
+            self.advance();
+            let condition = self.parse_expr()?;
+            self.expect(&Token::Colon)?;
+            let body = self.parse_statements_until_if_boundary()?;
+            branches.push(IfBranch { condition, body });
+        }
+
+        let else_body = if self.current == Token::Else {
+            self.advance();
+            self.expect(&Token::Colon)?;
+            Some(self.parse_statements_until_if_boundary()?)
+        } else {
+            None
+        };
+
+        self.expect(&Token::ScopeEnd)?;
+        Ok(IfStmt {
+            branches,
+            else_body,
+        })
     }
 
     /// Parse a variable declaration: `定义 变量： [type] name = expr`
@@ -433,8 +534,139 @@ impl Parser {
         Ok(ExecuteStmt { target, args })
     }
 
-    /// Parse an expression (currently only integer literals).
+    /// Parse a C++-style expression subset.
     fn parse_expr(&mut self) -> Result<Expr, String> {
+        self.parse_logical_or()
+    }
+
+    fn parse_logical_or(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_logical_and()?;
+        while self.current == Token::OrOr {
+            self.advance();
+            let right = self.parse_logical_and()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op: BinaryOp::Or,
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_logical_and(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_equality()?;
+        while self.current == Token::AndAnd {
+            self.advance();
+            let right = self.parse_equality()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op: BinaryOp::And,
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_equality(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_comparison()?;
+        loop {
+            let op = match self.current {
+                Token::EqEq => BinaryOp::Eq,
+                Token::NotEq => BinaryOp::NotEq,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_comparison()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_comparison(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_term()?;
+        loop {
+            let op = match self.current {
+                Token::Less => BinaryOp::Less,
+                Token::LessEq => BinaryOp::LessEq,
+                Token::Greater => BinaryOp::Greater,
+                Token::GreaterEq => BinaryOp::GreaterEq,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_term()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_term(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_factor()?;
+        loop {
+            let op = match self.current {
+                Token::Plus => BinaryOp::Add,
+                Token::Minus => BinaryOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_factor()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_factor(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_unary()?;
+        loop {
+            let op = match self.current {
+                Token::Star => BinaryOp::Mul,
+                Token::Slash => BinaryOp::Div,
+                Token::Percent => BinaryOp::Rem,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_unary()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr, String> {
+        match self.current {
+            Token::Minus => {
+                self.advance();
+                Ok(Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(self.parse_unary()?),
+                })
+            }
+            Token::Bang => {
+                self.advance();
+                Ok(Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(self.parse_unary()?),
+                })
+            }
+            _ => self.parse_primary(),
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr, String> {
         match &self.current {
             Token::IntLiteral(val) => {
                 let val = *val;
@@ -446,9 +678,82 @@ impl Parser {
                 self.advance();
                 Ok(Expr::StringLiteral(val))
             }
+            Token::FormattedStringLiteral(val) => {
+                let parts = parse_format_parts(val)?;
+                self.advance();
+                Ok(Expr::FormattedString(parts))
+            }
+            Token::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(Expr::Ident(name))
+            }
+            Token::LParen => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                self.expect(&Token::RParen)?;
+                Ok(expr)
+            }
             other => Err(format!("Expected expression, found {:?}", other)),
         }
     }
+}
+
+fn parse_format_parts(source: &str) -> Result<Vec<FormatPart>, String> {
+    let mut parts = Vec::new();
+    let mut text = String::new();
+    let mut chars = source.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    text.push('{');
+                    continue;
+                }
+
+                if !text.is_empty() {
+                    parts.push(FormatPart::Text(std::mem::take(&mut text)));
+                }
+
+                let mut name = String::new();
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(inner);
+                }
+
+                if !closed {
+                    return Err("Unclosed placeholder in formatted string".to_string());
+                }
+
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err("Empty placeholder in formatted string".to_string());
+                }
+                parts.push(FormatPart::Placeholder(name.to_string()));
+            }
+            '}' => {
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                    text.push('}');
+                } else {
+                    return Err("Single '}' in formatted string".to_string());
+                }
+            }
+            _ => text.push(ch),
+        }
+    }
+
+    if !text.is_empty() {
+        parts.push(FormatPart::Text(text));
+    }
+
+    Ok(parts)
 }
 
 #[cfg(test)]
@@ -623,6 +928,48 @@ mod tests {
                 );
             }
             other => panic!("Expected Execute, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_formatted_string() {
+        let source = "定义 方法 测试（）返回 无：设 x=10 执行输出：f“hello,{x}”。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[1] {
+            Stmt::Execute(exec) => {
+                assert_eq!(
+                    exec.args,
+                    vec![Expr::FormattedString(vec![
+                        FormatPart::Text("hello,".to_string()),
+                        FormatPart::Placeholder("x".to_string()),
+                    ])]
+                );
+            }
+            other => panic!("Expected Execute, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_if_else_and_cpp_expression_precedence() {
+        let source = "定义 方法 测试（）返回 无：设 x=5 判断x + 1 > 3 * 2：执行输出：“大”若x==5：执行输出：“等”否则：执行输出：“小”。。。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        assert_eq!(func.body.len(), 2);
+        match &func.body[1] {
+            Stmt::If(if_stmt) => {
+                assert_eq!(if_stmt.branches.len(), 2);
+                assert!(if_stmt.else_body.is_some());
+                assert_eq!(if_stmt.branches[0].body.len(), 1);
+                assert_eq!(if_stmt.branches[1].body.len(), 1);
+            }
+            other => panic!("Expected If, found {:?}", other),
         }
     }
 
