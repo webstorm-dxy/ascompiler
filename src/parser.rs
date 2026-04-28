@@ -2,7 +2,7 @@
 ///
 /// Converts a token stream into an AST. Handles `@声明 入口` annotations
 /// that mark the following function as the program entry point.
-use crate::lexer::{Lexer, Token};
+use crate::lexer::{Lexer, Span, Token};
 
 // ---------------------------------------------------------------------------
 // AST node definitions
@@ -59,6 +59,8 @@ pub enum Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssignStmt {
     pub name: String,
+    pub name_span: Span,
+    pub span: Span,
     pub value: Expr,
 }
 
@@ -77,6 +79,10 @@ pub struct ExecuteStmt {
 pub struct VarDecl {
     /// Variable name.
     pub name: String,
+    /// Source span for the variable name.
+    pub name_span: Span,
+    /// Source span for the whole declaration statement.
+    pub span: Span,
     /// Optional explicit type (None = type inferred from initializer).
     pub var_type: Option<Type>,
     /// True when the variable can be assigned after declaration.
@@ -200,6 +206,7 @@ impl Type {
 pub struct Parser {
     lexer: Lexer,
     current: Token,
+    current_span: Span,
     /// When true, the next function definition is the entry point.
     next_is_entry: bool,
     /// Whether this program has an entry point defined.
@@ -214,9 +221,11 @@ impl Parser {
     pub fn new(lexer: Lexer) -> Self {
         let mut lexer = lexer;
         let current = lexer.next_token();
+        let current_span = lexer.last_span();
         Parser {
             lexer,
             current,
+            current_span,
             next_is_entry: false,
             has_entry: false,
             next_is_external: false,
@@ -226,6 +235,29 @@ impl Parser {
 
     fn advance(&mut self) {
         self.current = self.lexer.next_token();
+        self.current_span = self.lexer.last_span();
+    }
+
+    fn error(&self, title: impl Into<String>, help: impl Into<String>) -> String {
+        render_diagnostic(
+            "解析错误",
+            title.into(),
+            self.lexer.source_name(),
+            self.lexer.source_text(),
+            self.current_span,
+            Some(help.into()),
+        )
+    }
+
+    fn lexical_error(&self, message: &str) -> String {
+        render_diagnostic(
+            "词法错误",
+            message.to_string(),
+            self.lexer.source_name(),
+            self.lexer.source_text(),
+            self.current_span,
+            Some("编译器在这里无法继续稳定地切分 token；请先修正这个字符或字面量。".to_string()),
+        )
     }
 
     /// Expect `expected`, advance if matched, error otherwise.
@@ -233,23 +265,42 @@ impl Parser {
         if &self.current == expected {
             self.advance();
             Ok(())
+        } else if let Token::Error(message) = &self.current {
+            Err(self.lexical_error(message))
         } else {
-            Err(format!(
-                "Expected {:?} but found {:?}",
-                expected, self.current
+            Err(self.error(
+                format!(
+                    "期望 `{}`，但找到了 `{}`",
+                    token_name(expected),
+                    token_name(&self.current)
+                ),
+                format!(
+                    "在这里补上 `{}`，或检查前一行是否少写了分隔符。",
+                    token_name(expected)
+                ),
             ))
         }
     }
 
     /// Expect an identifier, return its value.
     fn expect_ident(&mut self) -> Result<String, String> {
+        self.expect_ident_span().map(|(name, _)| name)
+    }
+
+    /// Expect an identifier, return its value and source span.
+    fn expect_ident_span(&mut self) -> Result<(String, Span), String> {
         match &self.current {
             Token::Ident(name) => {
                 let name = name.clone();
+                let span = self.current_span;
                 self.advance();
-                Ok(name)
+                Ok((name, span))
             }
-            other => Err(format!("Expected identifier but found {:?}", other)),
+            Token::Error(message) => Err(self.lexical_error(message)),
+            other => Err(self.error(
+                format!("期望标识符，但找到了 `{}`", token_name(other)),
+                "标识符通常是方法名、变量名或模块路径，例如 `测试`、`结果`、`标准库-输入输出`。",
+            )),
         }
     }
 
@@ -276,8 +327,14 @@ impl Parser {
                     let func = self.parse_function_def()?;
                     functions.push(func);
                 }
+                Token::Error(message) => {
+                    return Err(self.lexical_error(message));
+                }
                 other => {
-                    return Err(format!("Unexpected token {:?} at top level", other));
+                    return Err(self.error(
+                        format!("顶层不允许出现 `{}`", token_name(other)),
+                        "顶层只能写模块声明 `#模块 ...`、引用声明 `引用 模块：...`、`@声明 ...` 或 `定义 方法 ...`。",
+                    ));
                 }
             }
         }
@@ -330,7 +387,14 @@ impl Parser {
                 self.next_is_external = true;
                 Ok(())
             }
-            other => Err(format!("Expected 入口 after @声明, found {:?}", other)),
+            Token::Error(message) => Err(self.lexical_error(message)),
+            other => Err(self.error(
+                format!(
+                    "@声明 后只能写 `入口` 或 `外部`，但找到了 `{}`",
+                    token_name(other)
+                ),
+                "如果要声明入口点，请写 `@声明 入口`；如果要声明外部函数，请写 `@声明 外部`。",
+            )),
         }
     }
 
@@ -345,8 +409,12 @@ impl Parser {
             Token::Method => {
                 self.advance();
             }
+            Token::Error(message) => return Err(self.lexical_error(message)),
             other => {
-                return Err(format!("Expected 方法 after 定义, found {:?}", other));
+                return Err(self.error(
+                    format!("`定义` 后期望 `方法`，但找到了 `{}`", token_name(other)),
+                    "方法定义形如 `定义 方法 名称（参数：类型）返回 类型：...。。`；变量定义只能写在方法体里。",
+                ));
             }
         }
 
@@ -433,7 +501,16 @@ impl Parser {
                 self.advance();
                 Ok(t)
             }
-            None => Err(format!("Expected type keyword, found {:?}", self.current)),
+            None => {
+                if let Token::Error(message) = &self.current {
+                    Err(self.lexical_error(message))
+                } else {
+                    Err(self.error(
+                        format!("期望类型关键字，但找到了 `{}`", token_name(&self.current)),
+                        "可用类型包括 `无`、`整数`、`小数`、`浮点`、`布尔`、`字符`、`字符串`。",
+                    ))
+                }
+            }
         }
     }
 
@@ -475,7 +552,11 @@ impl Parser {
             Token::Execute => self.parse_execute_stmt().map(Stmt::Execute),
             Token::If => self.parse_if_stmt().map(Stmt::If),
             Token::Loop => self.parse_loop_stmt().map(Stmt::Loop),
-            other => Err(format!("Unexpected token {:?} in function body", other)),
+            Token::Error(message) => Err(self.lexical_error(message)),
+            other => Err(self.error(
+                format!("方法体内不能以 `{}` 开始一条语句", token_name(other)),
+                "这里可以写变量定义、赋值、返回、执行、判断、循环或局部引用语句。",
+            )),
         }
     }
 
@@ -534,12 +615,20 @@ impl Parser {
                 let body = self.parse_statements_until_scope_end()?;
                 Ok(LoopStmt::Condition { condition, body })
             }
-            other => Err(format!("Expected loop type after 循环, found {:?}", other)),
+            Token::Error(message) => Err(self.lexical_error(message)),
+            other => Err(self.error(
+                format!(
+                    "`循环` 后期望 `计数` 或 `条件`，但找到了 `{}`",
+                    token_name(other)
+                ),
+                "计数循环形如 `循环计数i<10：...。。`；条件循环形如 `循环条件 x<10：...。。`。",
+            )),
         }
     }
 
     /// Parse a variable declaration: `定义 [可变] 变量： [type] name = expr`
     fn parse_var_decl(&mut self) -> Result<VarDecl, String> {
+        let start = self.current_span.start;
         self.expect(&Token::Define)?;
         let is_mutable = if self.current == Token::Mutable {
             self.advance();
@@ -556,12 +645,18 @@ impl Parser {
             self.advance();
         }
 
-        let name = self.expect_ident()?;
+        let (name, name_span) = self.expect_ident_span()?;
         self.expect(&Token::Equals)?;
         let init = self.parse_expr()?;
+        let span = Span {
+            start,
+            end: self.current_span.start.max(name_span.end),
+        };
 
         Ok(VarDecl {
             name,
+            name_span,
+            span,
             var_type,
             is_mutable,
             init,
@@ -571,13 +666,20 @@ impl Parser {
     /// Parse a simplified variable declaration: `设 name = expr`.
     /// `设` variables are mutable by default.
     fn parse_let_stmt(&mut self) -> Result<VarDecl, String> {
+        let start = self.current_span.start;
         self.expect(&Token::Let)?;
-        let name = self.expect_ident()?;
+        let (name, name_span) = self.expect_ident_span()?;
         self.expect(&Token::Equals)?;
         let init = self.parse_expr()?;
+        let span = Span {
+            start,
+            end: self.current_span.start.max(name_span.end),
+        };
 
         Ok(VarDecl {
             name,
+            name_span,
+            span,
             var_type: None,
             is_mutable: true,
             init,
@@ -586,10 +688,20 @@ impl Parser {
 
     /// Parse an assignment statement: `name = expr`
     fn parse_assign_stmt(&mut self) -> Result<AssignStmt, String> {
-        let name = self.expect_ident()?;
+        let start = self.current_span.start;
+        let (name, name_span) = self.expect_ident_span()?;
         self.expect(&Token::Equals)?;
         let value = self.parse_expr()?;
-        Ok(AssignStmt { name, value })
+        let span = Span {
+            start,
+            end: self.current_span.start.max(name_span.end),
+        };
+        Ok(AssignStmt {
+            name,
+            name_span,
+            span,
+            value,
+        })
     }
 
     /// Parse `返回` or `返回 expr`.
@@ -774,7 +886,12 @@ impl Parser {
                 Ok(Expr::StringLiteral(val))
             }
             Token::FormattedStringLiteral(val) => {
-                let parts = parse_format_parts(val)?;
+                let parts = parse_format_parts(val).map_err(|msg| {
+                    self.error(
+                        format!("格式化字符串无效：{}", msg),
+                        "占位符需要写成 `{变量名}`；普通 `{` 和 `}` 请分别写成 `{{` 和 `}}`。",
+                    )
+                })?;
                 self.advance();
                 Ok(Expr::FormattedString(parts))
             }
@@ -806,9 +923,138 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(expr)
             }
-            other => Err(format!("Expected expression, found {:?}", other)),
+            Token::Error(message) => Err(self.lexical_error(message)),
+            other => Err(self.error(
+                format!("期望表达式，但找到了 `{}`", token_name(other)),
+                "表达式可以是整数、字符串、变量名、方法调用、括号表达式或一元/二元运算。",
+            )),
         }
     }
+}
+
+fn token_name(token: &Token) -> String {
+    match token {
+        Token::At => "@".to_string(),
+        Token::Declare => "声明".to_string(),
+        Token::Entry => "入口".to_string(),
+        Token::External => "外部".to_string(),
+        Token::Define => "定义".to_string(),
+        Token::Method => "方法".to_string(),
+        Token::Module => "模块".to_string(),
+        Token::ReturnKw => "返回".to_string(),
+        Token::If => "判断".to_string(),
+        Token::ElseIf => "若".to_string(),
+        Token::Else => "否则".to_string(),
+        Token::Loop => "循环".to_string(),
+        Token::Count => "计数".to_string(),
+        Token::Condition => "条件".to_string(),
+        Token::VoidKw => "无".to_string(),
+        Token::IntKw => "整数".to_string(),
+        Token::DoubleKw => "小数".to_string(),
+        Token::FloatKw => "浮点".to_string(),
+        Token::BoolKw => "布尔".to_string(),
+        Token::CharKw => "字符".to_string(),
+        Token::StringKw => "字符串".to_string(),
+        Token::IntTypeKw => "整型".to_string(),
+        Token::Variable => "变量".to_string(),
+        Token::Mutable => "可变".to_string(),
+        Token::Let => "设".to_string(),
+        Token::Hash => "#".to_string(),
+        Token::Import => "引用".to_string(),
+        Token::AsKw => "为".to_string(),
+        Token::Execute => "执行".to_string(),
+        Token::LParen => "(".to_string(),
+        Token::RParen => ")".to_string(),
+        Token::Colon => ":".to_string(),
+        Token::ScopeEnd => "。。".to_string(),
+        Token::Comma => ",".to_string(),
+        Token::Equals => "=".to_string(),
+        Token::Plus => "+".to_string(),
+        Token::Minus => "-".to_string(),
+        Token::Star => "*".to_string(),
+        Token::Slash => "/".to_string(),
+        Token::Percent => "%".to_string(),
+        Token::EqEq => "==".to_string(),
+        Token::NotEq => "!=".to_string(),
+        Token::Less => "<".to_string(),
+        Token::LessEq => "<=".to_string(),
+        Token::Greater => ">".to_string(),
+        Token::GreaterEq => ">=".to_string(),
+        Token::AndAnd => "&&".to_string(),
+        Token::OrOr => "||".to_string(),
+        Token::Bang => "!".to_string(),
+        Token::Ident(name) => format!("标识符 `{}`", name),
+        Token::IntLiteral(value) => format!("整数 `{}`", value),
+        Token::StringLiteral(_) => "字符串字面量".to_string(),
+        Token::FormattedStringLiteral(_) => "格式化字符串".to_string(),
+        Token::Error(message) => format!("错误 token（{}）", message),
+        Token::Eof => "文件结束".to_string(),
+    }
+}
+
+fn render_diagnostic(
+    kind: &str,
+    title: String,
+    source_name: Option<&str>,
+    source: &str,
+    span: Span,
+    help: Option<String>,
+) -> String {
+    let (line_no, col_no, line_start) = line_col(source, span.start);
+    let line_text = source.lines().nth(line_no.saturating_sub(1)).unwrap_or("");
+    let col_width = col_no.saturating_sub(1);
+    let caret_width = span
+        .end
+        .saturating_sub(span.start)
+        .min(line_text.chars().count().saturating_sub(col_width))
+        .max(1);
+    let line_number_width = line_no.to_string().len();
+    let mut out = String::new();
+
+    out.push_str(&format!("{}: {}\n", kind, title));
+    if let Some(source_name) = source_name {
+        out.push_str(&format!(" --> {}:{}:{}\n", source_name, line_no, col_no));
+    } else {
+        out.push_str(&format!(" --> 第 {} 行，第 {} 列\n", line_no, col_no));
+    }
+    out.push_str(&format!("{:>width$} |\n", "", width = line_number_width));
+    out.push_str(&format!(
+        "{:>width$} | {}\n",
+        line_no,
+        line_text,
+        width = line_number_width
+    ));
+    out.push_str(&format!(
+        "{:>width$} | {}{}\n",
+        "",
+        " ".repeat(col_width),
+        "^".repeat(caret_width),
+        width = line_number_width
+    ));
+    if let Some(help) = help {
+        out.push_str(&format!("  = 帮助: {}\n", help));
+    }
+    out.push_str(&format!("  = 位置: 字符偏移 {}\n", line_start + col_width));
+    out
+}
+
+fn line_col(source: &str, pos: usize) -> (usize, usize, usize) {
+    let mut line = 1;
+    let mut col = 1;
+    let mut line_start = 0;
+    for (idx, ch) in source.chars().enumerate() {
+        if idx == pos {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+            line_start = idx + 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col, line_start)
 }
 
 fn parse_format_parts(source: &str) -> Result<Vec<FormatPart>, String> {

@@ -50,30 +50,37 @@ fn main() {
     };
 
     // --- Lex + Parse ---
-    let lexer = Lexer::new(&source);
+    let lexer = Lexer::new_with_name(&source, input_path.display().to_string());
     let parser = Parser::new(lexer);
     let program = match parser.parse_program() {
         Ok(ast) => ast,
         Err(e) => {
-            eprintln!("解析错误: {}", e);
+            eprintln!("{}", e);
             process::exit(1);
         }
     };
     let program = match stdlib::merge_with_standard_library(program) {
         Ok(program) => program,
         Err(e) => {
-            eprintln!("标准库解析错误: {}", e);
+            eprintln!("标准库解析错误:\n{}", e);
             process::exit(1);
         }
     };
 
-    if let Err(e) = semantic::analyze(&program) {
-        eprintln!("语义错误: {}", e);
+    if let Err(e) = semantic::analyze_with_source(
+        &program,
+        Some(&source),
+        Some(&input_path.display().to_string()),
+    ) {
+        eprintln!("{}", e);
         process::exit(1);
     }
 
     if !ir_mode && !program.has_entry {
-        eprintln!("错误: 程序没有入口点 (@声明 入口)");
+        eprintln!(
+            "错误: 程序没有入口点\n --> {}\n  = 帮助: 在主方法前添加一行 `@声明 入口`，例如：\n\n@声明 入口\n定义 方法 主（）返回 无：\n。。",
+            input_path.display()
+        );
         process::exit(1);
     }
 
@@ -82,12 +89,12 @@ fn main() {
     let module = context.create_module("ascompiler");
 
     if let Err(e) = codegen::generate(&program, &context, &module) {
-        eprintln!("代码生成错误: {}", e);
+        eprintln!("代码生成错误:\n{}", e);
         process::exit(1);
     }
 
     if let Err(e) = module.verify() {
-        eprintln!("LLVM 模块验证失败: {}", e);
+        eprintln!("LLVM 模块验证失败:\n{}", e);
         process::exit(1);
     }
 

@@ -75,20 +75,51 @@ pub enum Token {
     FormattedStringLiteral(String),
 
     // Special
+    Error(String),
     Eof,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
 pub struct Lexer {
+    source_text: String,
+    source_name: Option<String>,
     source: Vec<char>,
     pos: usize,
+    last_span: Span,
 }
 
 impl Lexer {
     pub fn new(source: &str) -> Self {
         Lexer {
+            source_text: source.to_string(),
+            source_name: None,
             source: source.chars().collect(),
             pos: 0,
+            last_span: Span { start: 0, end: 0 },
         }
+    }
+
+    pub fn new_with_name(source: &str, source_name: impl Into<String>) -> Self {
+        let mut lexer = Self::new(source);
+        lexer.source_name = Some(source_name.into());
+        lexer
+    }
+
+    pub fn source_text(&self) -> &str {
+        &self.source_text
+    }
+
+    pub fn source_name(&self) -> Option<&str> {
+        self.source_name.as_deref()
+    }
+
+    pub fn last_span(&self) -> Span {
+        self.last_span
     }
 
     fn current(&self) -> Option<char> {
@@ -101,6 +132,13 @@ impl Lexer {
 
     fn advance(&mut self) {
         self.pos += 1;
+    }
+
+    fn mark_span(&mut self, start: usize) {
+        self.last_span = Span {
+            start,
+            end: self.pos.max(start + 1),
+        };
     }
 
     fn skip_whitespace(&mut self) {
@@ -286,8 +324,10 @@ impl Lexer {
                 break;
             }
         }
-        let val: i64 = num_str.parse().unwrap_or(0);
-        Token::IntLiteral(val)
+        match num_str.parse() {
+            Ok(val) => Token::IntLiteral(val),
+            Err(_) => Token::Error(format!("整数文字 `{}` 超出了 i64 的范围", num_str)),
+        }
     }
 
     /// Read a string literal. Supports English and Chinese quote pairs.
@@ -376,26 +416,27 @@ impl Lexer {
     /// Get the next token from the source.
     pub fn next_token(&mut self) -> Token {
         self.skip_whitespace();
+        let start = self.pos;
 
         let ch = match self.current() {
             Some(c) => c,
-            None => return Token::Eof,
+            None => {
+                self.last_span = Span {
+                    start: self.pos,
+                    end: self.pos,
+                };
+                return Token::Eof;
+            }
         };
 
-        match ch {
+        let token = match ch {
             'f' if self.peek(1) == Some('"') => match self.read_formatted_string('"', '"') {
                 Ok(token) => token,
-                Err(msg) => {
-                    eprintln!("Warning: {}", msg);
-                    Token::Eof
-                }
+                Err(msg) => Token::Error(msg),
             },
             'f' if self.peek(1) == Some('“') => match self.read_formatted_string('“', '”') {
                 Ok(token) => token,
-                Err(msg) => {
-                    eprintln!("Warning: {}", msg);
-                    Token::Eof
-                }
+                Err(msg) => Token::Error(msg),
             },
             '#' => {
                 self.advance();
@@ -407,17 +448,11 @@ impl Lexer {
             }
             '"' => match self.read_string('"') {
                 Ok(token) => token,
-                Err(msg) => {
-                    eprintln!("Warning: {}", msg);
-                    Token::Eof
-                }
+                Err(msg) => Token::Error(msg),
             },
             '“' => match self.read_string('”') {
                 Ok(token) => token,
-                Err(msg) => {
-                    eprintln!("Warning: {}", msg);
-                    Token::Eof
-                }
+                Err(msg) => Token::Error(msg),
             },
             '(' | '（' => {
                 self.advance();
@@ -513,8 +548,9 @@ impl Lexer {
                     self.advance();
                     Token::AndAnd
                 } else {
-                    eprintln!("Warning: unrecognized character: '&'");
-                    self.next_token()
+                    Token::Error(
+                        "无法识别字符 `&`；如果要表达逻辑且，请使用 `&&` 或 `且`".to_string(),
+                    )
                 }
             }
             '|' => {
@@ -523,8 +559,9 @@ impl Lexer {
                     self.advance();
                     Token::OrOr
                 } else {
-                    eprintln!("Warning: unrecognized character: '|'");
-                    self.next_token()
+                    Token::Error(
+                        "无法识别字符 `|`；如果要表达逻辑或，请使用 `||` 或 `或`".to_string(),
+                    )
                 }
             }
             _ => {
@@ -538,16 +575,17 @@ impl Lexer {
                 } else {
                     let ident = self.read_identifier();
                     if ident.is_empty() {
-                        // Should not happen but fallback
-                        eprintln!("Warning: unrecognized character: '{}'", ch);
                         self.advance();
-                        self.next_token()
+                        Token::Error(format!("无法识别字符 `{}`", ch))
                     } else {
                         Token::Ident(ident)
                     }
                 }
             }
-        }
+        };
+
+        self.mark_span(start);
+        token
     }
 }
 

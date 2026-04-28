@@ -1,3 +1,4 @@
+use crate::lexer::Span;
 use crate::parser::{
     AssignStmt, BinaryOp, Expr, FormatPart, FunctionDef, ImportDecl, Program, ReturnStmt, Stmt,
     Type, UnaryOp, VarDecl,
@@ -8,6 +9,13 @@ use std::collections::{HashMap, HashSet};
 struct LocalInfo {
     ty: Type,
     is_mutable: bool,
+    declaration_span: Option<Span>,
+}
+
+#[derive(Clone, Copy)]
+struct SourceContext<'a> {
+    source: Option<&'a str>,
+    source_name: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -37,7 +45,20 @@ impl ModuleRegistry {
     }
 }
 
+#[allow(dead_code)]
 pub fn analyze(program: &Program) -> Result<(), String> {
+    analyze_with_source(program, None, None)
+}
+
+pub fn analyze_with_source(
+    program: &Program,
+    source: Option<&str>,
+    source_name: Option<&str>,
+) -> Result<(), String> {
+    let source_context = SourceContext {
+        source,
+        source_name,
+    };
     let registry = ModuleRegistry::from_program(program);
 
     for import in &program.imports {
@@ -55,20 +76,31 @@ pub fn analyze(program: &Program) -> Result<(), String> {
                     LocalInfo {
                         ty: param.param_type.clone(),
                         is_mutable: false,
+                        declaration_span: None,
                     },
                 )
             })
             .collect();
 
         for stmt in &func.body {
-            validate_stmt(
+            if let Err(err) = validate_stmt(
                 stmt,
                 program,
                 func,
                 &registry,
                 &mut scoped_imports,
                 &mut locals,
-            )?;
+                source_context,
+            ) {
+                if err.starts_with("error[") || err.starts_with("错误[") {
+                    return Err(err);
+                }
+                return Err(format!(
+                    "{}\n --> 方法 `{}`\n  = 帮助: 语义错误通常不是标点问题，而是名字解析、类型或可变性不满足要求；请从上面指出的实体开始检查。",
+                    err,
+                    function_path(func)
+                ));
+            }
         }
     }
 
@@ -82,6 +114,7 @@ fn validate_stmt(
     registry: &ModuleRegistry,
     scoped_imports: &mut Vec<ImportDecl>,
     locals: &mut HashMap<String, LocalInfo>,
+    source_context: SourceContext<'_>,
 ) -> Result<(), String> {
     match stmt {
         Stmt::Import(import) => {
@@ -99,7 +132,14 @@ fn validate_stmt(
             validate_var_decl(var, program, func, scoped_imports, locals)?;
         }
         Stmt::Assign(assign) => {
-            validate_assign_stmt(assign, program, func, scoped_imports, locals)?;
+            validate_assign_stmt(
+                assign,
+                program,
+                func,
+                scoped_imports,
+                locals,
+                source_context,
+            )?;
         }
         Stmt::Return(ret) => {
             validate_return_stmt(
@@ -124,6 +164,7 @@ fn validate_stmt(
                         registry,
                         &mut branch_imports,
                         &mut branch_locals,
+                        source_context,
                     )?;
                 }
             }
@@ -138,6 +179,7 @@ fn validate_stmt(
                         registry,
                         &mut branch_imports,
                         &mut branch_locals,
+                        source_context,
                     )?;
                 }
             }
@@ -150,7 +192,10 @@ fn validate_stmt(
             } => {
                 let end_type = validate_expr(end, program, func, scoped_imports, locals)?;
                 if end_type != Type::Int {
-                    return Err(format!("计数循环上限必须是整数，找到 {:?}", end_type));
+                    return Err(format!(
+                        "计数循环上限类型不匹配\n  = 期望: 整数\n  = 实际: {}",
+                        type_name(&end_type)
+                    ));
                 }
 
                 let mut loop_locals = locals.clone();
@@ -159,6 +204,7 @@ fn validate_stmt(
                     LocalInfo {
                         ty: Type::Int,
                         is_mutable: false,
+                        declaration_span: None,
                     },
                 );
                 let mut loop_imports = scoped_imports.clone();
@@ -170,6 +216,7 @@ fn validate_stmt(
                         registry,
                         &mut loop_imports,
                         &mut loop_locals,
+                        source_context,
                     )?;
                 }
             }
@@ -185,6 +232,7 @@ fn validate_stmt(
                         registry,
                         &mut loop_imports,
                         &mut loop_locals,
+                        source_context,
                     )?;
                 }
             }
@@ -207,6 +255,7 @@ fn validate_var_decl(
         LocalInfo {
             ty: var_type,
             is_mutable: var.is_mutable,
+            declaration_span: Some(var.name_span),
         },
     );
     Ok(())
@@ -218,20 +267,40 @@ fn validate_assign_stmt(
     func: &FunctionDef,
     scoped_imports: &[ImportDecl],
     locals: &HashMap<String, LocalInfo>,
+    source_context: SourceContext<'_>,
 ) -> Result<(), String> {
-    let target = locals
-        .get(&assign.name)
-        .ok_or_else(|| format!("未定义的变量: {}", assign.name))?;
+    let target = locals.get(&assign.name).ok_or_else(|| {
+        format!(
+            "未定义的变量 `{}`\n  = 帮助: 请确认变量已在当前方法、判断分支或循环作用域中声明。",
+            assign.name
+        )
+    })?;
     if !target.is_mutable {
-        return Err(format!("不可变变量不能重新赋值: {}", assign.name));
+        if let (Some(source), Some(declaration_span)) =
+            (source_context.source, target.declaration_span)
+        {
+            return Err(render_immutable_assignment(
+                source_context.source_name,
+                source,
+                &assign.name,
+                declaration_span,
+                assign.span,
+            ));
+        }
+        return Err(format!(
+            "不可变变量不能重新赋值: `{}`\n  = 原因: `定义 变量` 默认不可变\n  = 帮助: 如果需要重新赋值，请声明为 `定义 可变 变量：{} = ...`，或使用 `设 {}`。",
+            assign.name, assign.name, assign.name
+        ));
     }
     let value_type = validate_expr(&assign.value, program, func, scoped_imports, locals)?;
     if value_type == target.ty {
         Ok(())
     } else {
         Err(format!(
-            "赋值类型不匹配: {} 是 {:?}, 但表达式是 {:?}",
-            assign.name, target.ty, value_type
+            "赋值类型不匹配: `{}`\n  = 变量类型: {}\n  = 表达式类型: {}\n  = 帮助: 请让右侧表达式返回相同类型，或调整变量的声明类型。",
+            assign.name,
+            type_name(&target.ty),
+            type_name(&value_type)
         ))
     }
 }
@@ -246,16 +315,23 @@ fn validate_return_stmt(
 ) -> Result<(), String> {
     match (&ret.value, expected_type) {
         (None, Type::Void) => Ok(()),
-        (None, other) => Err(format!("返回语句缺少 {:?} 类型的值", other)),
-        (Some(_), Type::Void) => Err("无返回值方法不能返回表达式".to_string()),
+        (None, other) => Err(format!(
+            "返回语句缺少返回值\n  = 期望返回类型: {}\n  = 帮助: 写成 `返回 <表达式>`，或把方法返回类型改为 `无`。",
+            type_name(other)
+        )),
+        (Some(_), Type::Void) => Err(
+            "无返回值方法不能返回表达式\n  = 期望: 只写 `返回` 或省略返回语句\n  = 帮助: 如果确实需要返回值，请修改方法签名中的 `返回 无`。"
+                .to_string(),
+        ),
         (Some(expr), expected) => {
             let actual = validate_expr(expr, program, func, scoped_imports, locals)?;
             if &actual == expected {
                 Ok(())
             } else {
                 Err(format!(
-                    "返回类型不匹配: 期望 {:?}, 找到 {:?}",
-                    expected, actual
+                    "返回类型不匹配\n  = 期望: {}\n  = 实际: {}\n  = 帮助: 返回表达式的类型必须和方法签名里的返回类型一致。",
+                    type_name(expected),
+                    type_name(&actual)
                 ))
             }
         }
@@ -271,7 +347,10 @@ fn validate_condition(
 ) -> Result<(), String> {
     match validate_expr(expr, program, func, scoped_imports, locals)? {
         Type::Int | Type::Bool => Ok(()),
-        other => Err(format!("条件表达式必须是整数或布尔，找到 {:?}", other)),
+        other => Err(format!(
+            "条件表达式类型不匹配\n  = 期望: 整数 或 布尔\n  = 实际: {}",
+            type_name(&other)
+        )),
     }
 }
 
@@ -287,21 +366,29 @@ fn validate_expr(
         Expr::Ident(name) => locals
             .get(name)
             .map(|local| local.ty.clone())
-            .ok_or_else(|| format!("未定义的变量: {}", name)),
+            .ok_or_else(|| {
+                format!(
+                    "未定义的变量 `{}`\n  = 帮助: 请确认名字拼写一致，并且声明出现在使用之前。",
+                    name
+                )
+            }),
         Expr::Call { target, args } => {
             let resolved = resolve_execute_target(program, func, scoped_imports, target)
-                .ok_or_else(|| format!("未找到模块或方法: {}", target))?;
+                .ok_or_else(|| format!("未找到模块或方法 `{}`\n  = 帮助: 如果这是外部模块中的方法，请先写 `引用 模块：路径`，或使用引用别名。", target))?;
             let called_func = program
                 .functions
                 .iter()
                 .find(|candidate| function_path(candidate) == resolved)
                 .ok_or_else(|| format!("未找到方法: {}", resolved))?;
             if called_func.return_type == Type::Void {
-                return Err(format!("方法没有返回值: {}", target));
+                return Err(format!(
+                    "方法 `{}` 没有返回值\n  = 实际返回类型: 无\n  = 帮助: `无` 返回值的方法只能用 `执行` 调用，不能放在表达式里。",
+                    target
+                ));
             }
             if args.len() != called_func.params.len() {
                 return Err(format!(
-                    "方法 {} 需要 {} 个参数，找到 {} 个",
+                    "方法 `{}` 的参数数量不匹配\n  = 期望: {} 个\n  = 实际: {} 个",
                     target,
                     called_func.params.len(),
                     args.len()
@@ -311,8 +398,11 @@ fn validate_expr(
                 let arg_type = validate_expr(arg, program, func, scoped_imports, locals)?;
                 if arg_type != param.param_type {
                     return Err(format!(
-                        "方法 {} 的参数 {} 类型不匹配: 期望 {:?}, 找到 {:?}",
-                        target, param.name, param.param_type, arg_type
+                        "方法 `{}` 的参数 `{}` 类型不匹配\n  = 期望: {}\n  = 实际: {}",
+                        target,
+                        param.name,
+                        type_name(&param.param_type),
+                        type_name(&arg_type)
                     ));
                 }
             }
@@ -324,7 +414,7 @@ fn validate_expr(
                 if let FormatPart::Placeholder(name) = part {
                     locals
                         .get(name)
-                        .ok_or_else(|| format!("未定义的格式化变量: {}", name))?;
+                        .ok_or_else(|| format!("未定义的格式化变量 `{}`\n  = 帮助: 格式化字符串 `{{...}}` 中只能引用当前作用域内已声明的变量。", name))?;
                 }
             }
             Ok(Type::String)
@@ -334,8 +424,8 @@ fn validate_expr(
             match (op, ty) {
                 (UnaryOp::Neg, Type::Int) => Ok(Type::Int),
                 (UnaryOp::Not, Type::Int | Type::Bool) => Ok(Type::Bool),
-                (UnaryOp::Neg, other) => Err(format!("一元 - 不支持 {:?} 类型", other)),
-                (UnaryOp::Not, other) => Err(format!("一元 ! 不支持 {:?} 类型", other)),
+                (UnaryOp::Neg, other) => Err(format!("一元 `-` 不支持 {} 类型", type_name(&other))),
+                (UnaryOp::Not, other) => Err(format!("一元 `!` 不支持 {} 类型", type_name(&other))),
             }
         }
         Expr::Binary { left, op, right } => {
@@ -347,8 +437,10 @@ fn validate_expr(
                         Ok(Type::Int)
                     } else {
                         Err(format!(
-                            "运算符 {:?} 需要整数操作数，找到 {:?} 和 {:?}",
-                            op, left_ty, right_ty
+                            "算术运算符 `{}` 需要整数操作数\n  = 左侧: {}\n  = 右侧: {}",
+                            binary_op_name(op),
+                            type_name(&left_ty),
+                            type_name(&right_ty)
                         ))
                     }
                 }
@@ -357,8 +449,10 @@ fn validate_expr(
                         Ok(Type::Bool)
                     } else {
                         Err(format!(
-                            "运算符 {:?} 两侧类型必须相同，找到 {:?} 和 {:?}",
-                            op, left_ty, right_ty
+                            "相等运算符 `{}` 两侧类型必须相同\n  = 左侧: {}\n  = 右侧: {}",
+                            binary_op_name(op),
+                            type_name(&left_ty),
+                            type_name(&right_ty)
                         ))
                     }
                 }
@@ -367,8 +461,10 @@ fn validate_expr(
                         Ok(Type::Bool)
                     } else {
                         Err(format!(
-                            "比较运算符 {:?} 需要整数操作数，找到 {:?} 和 {:?}",
-                            op, left_ty, right_ty
+                            "比较运算符 `{}` 需要整数操作数\n  = 左侧: {}\n  = 右侧: {}",
+                            binary_op_name(op),
+                            type_name(&left_ty),
+                            type_name(&right_ty)
                         ))
                     }
                 }
@@ -379,8 +475,10 @@ fn validate_expr(
                         Ok(Type::Bool)
                     } else {
                         Err(format!(
-                            "逻辑运算符 {:?} 需要整数或布尔操作数，找到 {:?} 和 {:?}",
-                            op, left_ty, right_ty
+                            "逻辑运算符 `{}` 需要整数或布尔操作数\n  = 左侧: {}\n  = 右侧: {}",
+                            binary_op_name(op),
+                            type_name(&left_ty),
+                            type_name(&right_ty)
                         ))
                     }
                 }
@@ -393,7 +491,175 @@ fn validate_import(import: &ImportDecl, registry: &ModuleRegistry) -> Result<(),
     if registry.import_exists(&import.path) {
         Ok(())
     } else {
-        Err(format!("未找到模块或方法: {}", import.path))
+        Err(format!(
+            "未找到模块或方法 `{}`\n  = 帮助: 请确认 `#模块` 路径、方法名以及 `引用 模块：...` 中的路径完全一致。",
+            import.path
+        ))
+    }
+}
+
+fn render_immutable_assignment(
+    source_name: Option<&str>,
+    source: &str,
+    name: &str,
+    declaration_span: Span,
+    assignment_span: Span,
+) -> String {
+    let (assign_line, assign_col, _) = line_col(source, assignment_span.start);
+    let location = match source_name {
+        Some(source_name) => format!("{}:{}:{}", source_name, assign_line, assign_col),
+        None => format!("第 {} 行，第 {} 列", assign_line, assign_col),
+    };
+    let line_number_width = assign_line
+        .max(line_col(source, declaration_span.start).0)
+        .to_string()
+        .len();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "错误[E0384]: 不能给不可变变量 `{}` 重复赋值\n",
+        name
+    ));
+    out.push_str(&format!(" --> {}\n", location));
+    out.push_str(&format!("{:>width$} |\n", "", width = line_number_width));
+    push_span_note(
+        &mut out,
+        source,
+        declaration_span,
+        &format!("第一次赋值给 `{}`", name),
+        line_number_width,
+        true,
+    );
+    push_span_note(
+        &mut out,
+        source,
+        assignment_span,
+        "不能给不可变变量重复赋值",
+        line_number_width,
+        false,
+    );
+    out.push_str(&format!("{:>width$} |\n", "", width = line_number_width));
+    out.push_str("帮助: 可以把这个绑定声明为可变\n");
+    if let Some((line_no, suggested, plus_col, plus_width)) =
+        mutable_suggestion(source, declaration_span)
+    {
+        out.push_str(&format!("{:>width$} |\n", "", width = line_number_width));
+        out.push_str(&format!(
+            "{:>width$} | {}\n",
+            line_no,
+            suggested,
+            width = line_number_width
+        ));
+        out.push_str(&format!(
+            "{:>width$} | {}{}\n",
+            "",
+            " ".repeat(plus_col.saturating_sub(1)),
+            "+".repeat(plus_width),
+            width = line_number_width
+        ));
+    } else {
+        out.push_str("  = 帮助: 将声明改为 `定义 可变 变量：...`，或使用 `设` 声明可变变量。\n");
+    }
+
+    out
+}
+
+fn push_span_note(
+    out: &mut String,
+    source: &str,
+    span: Span,
+    label: &str,
+    line_number_width: usize,
+    is_secondary: bool,
+) {
+    let (line_no, col_no, _) = line_col(source, span.start);
+    let line_text = source.lines().nth(line_no.saturating_sub(1)).unwrap_or("");
+    let col_width = col_no.saturating_sub(1);
+    let caret_width = span
+        .end
+        .saturating_sub(span.start)
+        .min(line_text.chars().count().saturating_sub(col_width))
+        .max(1);
+    let marker = if is_secondary { "-" } else { "^" };
+
+    out.push_str(&format!(
+        "{:>width$} | {}\n",
+        line_no,
+        line_text,
+        width = line_number_width
+    ));
+    out.push_str(&format!(
+        "{:>width$} | {}{} {}\n",
+        "",
+        " ".repeat(col_width),
+        marker.repeat(caret_width),
+        label,
+        width = line_number_width
+    ));
+}
+
+fn mutable_suggestion(
+    source: &str,
+    declaration_span: Span,
+) -> Option<(usize, String, usize, usize)> {
+    let (line_no, _, _) = line_col(source, declaration_span.start);
+    let line_text = source.lines().nth(line_no.saturating_sub(1))?;
+    let keyword_byte = line_text.find("变量")?;
+    let mut suggested = String::new();
+    suggested.push_str(&line_text[..keyword_byte]);
+    suggested.push_str("可变 ");
+    suggested.push_str(&line_text[keyword_byte..]);
+
+    let plus_col = line_text[..keyword_byte].chars().count() + 1;
+    Some((line_no, suggested, plus_col, "可变 ".chars().count()))
+}
+
+fn line_col(source: &str, pos: usize) -> (usize, usize, usize) {
+    let mut line = 1;
+    let mut col = 1;
+    let mut line_start = 0;
+    for (idx, ch) in source.chars().enumerate() {
+        if idx == pos {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+            line_start = idx + 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col, line_start)
+}
+
+fn type_name(ty: &Type) -> &'static str {
+    match ty {
+        Type::Void => "无",
+        Type::Int => "整数",
+        Type::Double => "小数",
+        Type::Float => "浮点",
+        Type::Bool => "布尔",
+        Type::Char => "字符",
+        Type::String => "字符串",
+    }
+}
+
+fn binary_op_name(op: &BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Rem => "%",
+        BinaryOp::Eq => "==",
+        BinaryOp::NotEq => "!=",
+        BinaryOp::Less => "<",
+        BinaryOp::LessEq => "<=",
+        BinaryOp::Greater => ">",
+        BinaryOp::GreaterEq => ">=",
+        BinaryOp::And => "&&",
+        BinaryOp::Or => "||",
     }
 }
 
