@@ -48,9 +48,23 @@ pub struct FunctionDef {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     VarDecl(VarDecl),
+    Assign(AssignStmt),
+    Return(ReturnStmt),
     Import(ImportDecl),
     Execute(ExecuteStmt),
     If(IfStmt),
+    Loop(LoopStmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssignStmt {
+    pub name: String,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnStmt {
+    pub value: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,11 +96,28 @@ pub struct IfBranch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum LoopStmt {
+    Count {
+        var_name: String,
+        end: Expr,
+        body: Vec<Stmt>,
+    },
+    Condition {
+        condition: Expr,
+        body: Vec<Stmt>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLiteral(i64),
     StringLiteral(String),
     FormattedString(Vec<FormatPart>),
     Ident(String),
+    Call {
+        target: String,
+        args: Vec<Expr>,
+    },
     Unary {
         op: UnaryOp,
         expr: Box<Expr>,
@@ -436,9 +467,12 @@ impl Parser {
         match &self.current {
             Token::Define => self.parse_var_decl().map(Stmt::VarDecl),
             Token::Let => self.parse_let_stmt().map(Stmt::VarDecl),
+            Token::ReturnKw => self.parse_return_stmt().map(Stmt::Return),
+            Token::Ident(_) => self.parse_assign_stmt().map(Stmt::Assign),
             Token::Import => self.parse_import_decl().map(Stmt::Import),
             Token::Execute => self.parse_execute_stmt().map(Stmt::Execute),
             Token::If => self.parse_if_stmt().map(Stmt::If),
+            Token::Loop => self.parse_loop_stmt().map(Stmt::Loop),
             other => Err(format!("Unexpected token {:?} in function body", other)),
         }
     }
@@ -472,6 +506,34 @@ impl Parser {
             branches,
             else_body,
         })
+    }
+
+    /// Parse `循环计数i<end：...。。` or `循环条件 condition：...。。`.
+    fn parse_loop_stmt(&mut self) -> Result<LoopStmt, String> {
+        self.expect(&Token::Loop)?;
+        match &self.current {
+            Token::Count => {
+                self.advance();
+                let var_name = self.expect_ident()?;
+                self.expect(&Token::Less)?;
+                let end = self.parse_expr()?;
+                self.expect(&Token::Colon)?;
+                let body = self.parse_statements_until_scope_end()?;
+                Ok(LoopStmt::Count {
+                    var_name,
+                    end,
+                    body,
+                })
+            }
+            Token::Condition => {
+                self.advance();
+                let condition = self.parse_expr()?;
+                self.expect(&Token::Colon)?;
+                let body = self.parse_statements_until_scope_end()?;
+                Ok(LoopStmt::Condition { condition, body })
+            }
+            other => Err(format!("Expected loop type after 循环, found {:?}", other)),
+        }
     }
 
     /// Parse a variable declaration: `定义 变量： [type] name = expr`
@@ -509,6 +571,28 @@ impl Parser {
             var_type: None,
             init,
         })
+    }
+
+    /// Parse an assignment statement: `name = expr`
+    fn parse_assign_stmt(&mut self) -> Result<AssignStmt, String> {
+        let name = self.expect_ident()?;
+        self.expect(&Token::Equals)?;
+        let value = self.parse_expr()?;
+        Ok(AssignStmt { name, value })
+    }
+
+    /// Parse `返回` or `返回 expr`.
+    fn parse_return_stmt(&mut self) -> Result<ReturnStmt, String> {
+        self.expect(&Token::ReturnKw)?;
+        let value = if matches!(
+            self.current,
+            Token::ScopeEnd | Token::ElseIf | Token::Else | Token::Eof
+        ) {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        Ok(ReturnStmt { value })
     }
 
     /// Parse `执行 target：arg1，arg2`. Whitespace between 执行 and target is optional.
@@ -686,7 +770,24 @@ impl Parser {
             Token::Ident(name) => {
                 let name = name.clone();
                 self.advance();
-                Ok(Expr::Ident(name))
+                if self.current == Token::LParen {
+                    self.advance();
+                    let mut args = Vec::new();
+                    if self.current != Token::RParen {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if self.current == Token::Comma {
+                                self.advance();
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(&Token::RParen)?;
+                    Ok(Expr::Call { target: name, args })
+                } else {
+                    Ok(Expr::Ident(name))
+                }
             }
             Token::LParen => {
                 self.advance();
@@ -970,6 +1071,107 @@ mod tests {
                 assert_eq!(if_stmt.branches[1].body.len(), 1);
             }
             other => panic!("Expected If, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_loop_without_spaces() {
+        let source = "定义 方法 测试（）返回 无：循环计数i<10：执行输出：f“{i}”。。。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        assert_eq!(func.body.len(), 1);
+        match &func.body[0] {
+            Stmt::Loop(LoopStmt::Count {
+                var_name,
+                end,
+                body,
+            }) => {
+                assert_eq!(var_name, "i");
+                assert_eq!(end, &Expr::IntLiteral(10));
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("Expected count loop, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_condition_loop_with_space() {
+        let source = "定义 方法 测试（）返回 无：设 x=1 循环 条件 x<3：执行输出：“x”。。。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        assert_eq!(func.body.len(), 2);
+        match &func.body[1] {
+            Stmt::Loop(LoopStmt::Condition { condition, body }) => {
+                assert_eq!(
+                    condition,
+                    &Expr::Binary {
+                        left: Box::new(Expr::Ident("x".to_string())),
+                        op: BinaryOp::Less,
+                        right: Box::new(Expr::IntLiteral(3)),
+                    }
+                );
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("Expected condition loop, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_returning_count_loop_with_assignment() {
+        let source = "定义 方法 从零求和（结束值：整数）返回 整数：设 cnt = 0 循环计数i<结束值：cnt=cnt+1。。返回 cnt。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        assert_eq!(func.return_type, Type::Int);
+        assert_eq!(func.params[0].name, "结束值");
+        assert_eq!(func.body.len(), 3);
+        match &func.body[1] {
+            Stmt::Loop(LoopStmt::Count {
+                var_name,
+                end,
+                body,
+            }) => {
+                assert_eq!(var_name, "i");
+                assert_eq!(end, &Expr::Ident("结束值".to_string()));
+                assert_eq!(body.len(), 1);
+                match &body[0] {
+                    Stmt::Assign(assign) => assert_eq!(assign.name, "cnt"),
+                    other => panic!("Expected assignment, found {:?}", other),
+                }
+            }
+            other => panic!("Expected count loop, found {:?}", other),
+        }
+        assert!(matches!(&func.body[2], Stmt::Return(_)));
+    }
+
+    #[test]
+    fn test_parse_call_expression_in_let() {
+        let source = "定义 方法 从零求和（结束值：整数）返回 整数：返回 结束值。。定义 方法 测试（）返回 无：设 s = 从零求和（10）。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[1];
+        match &func.body[0] {
+            Stmt::VarDecl(var) => {
+                assert_eq!(var.name, "s");
+                assert_eq!(
+                    var.init,
+                    Expr::Call {
+                        target: "从零求和".to_string(),
+                        args: vec![Expr::IntLiteral(10)],
+                    }
+                );
+            }
+            other => panic!("Expected VarDecl, found {:?}", other),
         }
     }
 

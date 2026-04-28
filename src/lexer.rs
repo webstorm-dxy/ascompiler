@@ -17,10 +17,13 @@ pub enum Token {
     Module, // 模块
 
     // Control flow
-    ReturnKw, // 返回
-    If,       // 判断
-    ElseIf,   // 若
-    Else,     // 否则
+    ReturnKw,  // 返回
+    If,        // 判断
+    ElseIf,    // 若
+    Else,      // 否则
+    Loop,      // 循环
+    Count,     // 计数
+    Condition, // 条件
 
     // Types
     VoidKw,    // 无
@@ -159,6 +162,9 @@ impl Lexer {
                     ['返', '回'] => Some(Token::ReturnKw),
                     ['判', '断'] => Some(Token::If),
                     ['否', '则'] => Some(Token::Else),
+                    ['循', '环'] => Some(Token::Loop),
+                    ['计', '数'] => Some(Token::Count),
+                    ['条', '件'] => Some(Token::Condition),
                     ['引', '用'] => Some(Token::Import),
                     ['执', '行'] => Some(Token::Execute),
                     ['整', '数'] => Some(Token::IntKw),
@@ -244,6 +250,9 @@ impl Lexer {
                         | ['返', '回']
                         | ['判', '断']
                         | ['否', '则']
+                        | ['循', '环']
+                        | ['计', '数']
+                        | ['条', '件']
                         | ['引', '用']
                         | ['执', '行']
                         | ['整', '数']
@@ -676,6 +685,27 @@ mod tests {
         assert_eq!(lexer.next_token(), Token::Colon);
         assert_eq!(lexer.next_token(), Token::Else);
         assert_eq!(lexer.next_token(), Token::Colon);
+    }
+
+    #[test]
+    fn test_loop_keywords_without_spaces() {
+        let source = "循环计数i<10：循环条件i<5：。。。。";
+        let mut lexer = Lexer::new(source);
+
+        assert_eq!(lexer.next_token(), Token::Loop);
+        assert_eq!(lexer.next_token(), Token::Count);
+        assert_eq!(lexer.next_token(), Token::Ident("i".to_string()));
+        assert_eq!(lexer.next_token(), Token::Less);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(10));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::Loop);
+        assert_eq!(lexer.next_token(), Token::Condition);
+        assert_eq!(lexer.next_token(), Token::Ident("i".to_string()));
+        assert_eq!(lexer.next_token(), Token::Less);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(5));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::ScopeEnd);
+        assert_eq!(lexer.next_token(), Token::ScopeEnd);
     }
 
     #[test]

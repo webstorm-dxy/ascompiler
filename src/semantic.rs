@@ -1,5 +1,6 @@
 use crate::parser::{
-    BinaryOp, Expr, FormatPart, FunctionDef, ImportDecl, Program, Stmt, Type, UnaryOp, VarDecl,
+    AssignStmt, BinaryOp, Expr, FormatPart, FunctionDef, ImportDecl, Program, ReturnStmt, Stmt,
+    Type, UnaryOp, VarDecl,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -77,15 +78,28 @@ fn validate_stmt(
             resolve_execute_target(program, func, scoped_imports, &exec.target)
                 .ok_or_else(|| format!("未找到模块或方法: {}", exec.target))?;
             for arg in &exec.args {
-                validate_expr(arg, locals)?;
+                validate_expr(arg, program, func, scoped_imports, locals)?;
             }
         }
         Stmt::VarDecl(var) => {
-            validate_var_decl(var, locals)?;
+            validate_var_decl(var, program, func, scoped_imports, locals)?;
+        }
+        Stmt::Assign(assign) => {
+            validate_assign_stmt(assign, program, func, scoped_imports, locals)?;
+        }
+        Stmt::Return(ret) => {
+            validate_return_stmt(
+                ret,
+                &func.return_type,
+                program,
+                func,
+                scoped_imports,
+                locals,
+            )?;
         }
         Stmt::If(if_stmt) => {
             for branch in &if_stmt.branches {
-                validate_condition(&branch.condition, locals)?;
+                validate_condition(&branch.condition, program, func, scoped_imports, locals)?;
                 let mut branch_locals = locals.clone();
                 let mut branch_imports = scoped_imports.clone();
                 for stmt in &branch.body {
@@ -114,31 +128,167 @@ fn validate_stmt(
                 }
             }
         }
+        Stmt::Loop(loop_stmt) => match loop_stmt {
+            crate::parser::LoopStmt::Count {
+                var_name,
+                end,
+                body,
+            } => {
+                let end_type = validate_expr(end, program, func, scoped_imports, locals)?;
+                if end_type != Type::Int {
+                    return Err(format!("计数循环上限必须是整数，找到 {:?}", end_type));
+                }
+
+                let mut loop_locals = locals.clone();
+                loop_locals.insert(var_name.clone(), Type::Int);
+                let mut loop_imports = scoped_imports.clone();
+                for stmt in body {
+                    validate_stmt(
+                        stmt,
+                        program,
+                        func,
+                        registry,
+                        &mut loop_imports,
+                        &mut loop_locals,
+                    )?;
+                }
+            }
+            crate::parser::LoopStmt::Condition { condition, body } => {
+                validate_condition(condition, program, func, scoped_imports, locals)?;
+                let mut loop_locals = locals.clone();
+                let mut loop_imports = scoped_imports.clone();
+                for stmt in body {
+                    validate_stmt(
+                        stmt,
+                        program,
+                        func,
+                        registry,
+                        &mut loop_imports,
+                        &mut loop_locals,
+                    )?;
+                }
+            }
+        },
     }
     Ok(())
 }
 
-fn validate_var_decl(var: &VarDecl, locals: &mut HashMap<String, Type>) -> Result<(), String> {
-    let inferred_type = validate_expr(&var.init, locals)?;
+fn validate_var_decl(
+    var: &VarDecl,
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &mut HashMap<String, Type>,
+) -> Result<(), String> {
+    let inferred_type = validate_expr(&var.init, program, func, scoped_imports, locals)?;
     let var_type = var.var_type.clone().unwrap_or(inferred_type);
     locals.insert(var.name.clone(), var_type);
     Ok(())
 }
 
-fn validate_condition(expr: &Expr, locals: &HashMap<String, Type>) -> Result<(), String> {
-    match validate_expr(expr, locals)? {
+fn validate_assign_stmt(
+    assign: &AssignStmt,
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, Type>,
+) -> Result<(), String> {
+    let target_type = locals
+        .get(&assign.name)
+        .ok_or_else(|| format!("未定义的变量: {}", assign.name))?;
+    let value_type = validate_expr(&assign.value, program, func, scoped_imports, locals)?;
+    if &value_type == target_type {
+        Ok(())
+    } else {
+        Err(format!(
+            "赋值类型不匹配: {} 是 {:?}, 但表达式是 {:?}",
+            assign.name, target_type, value_type
+        ))
+    }
+}
+
+fn validate_return_stmt(
+    ret: &ReturnStmt,
+    expected_type: &Type,
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, Type>,
+) -> Result<(), String> {
+    match (&ret.value, expected_type) {
+        (None, Type::Void) => Ok(()),
+        (None, other) => Err(format!("返回语句缺少 {:?} 类型的值", other)),
+        (Some(_), Type::Void) => Err("无返回值方法不能返回表达式".to_string()),
+        (Some(expr), expected) => {
+            let actual = validate_expr(expr, program, func, scoped_imports, locals)?;
+            if &actual == expected {
+                Ok(())
+            } else {
+                Err(format!(
+                    "返回类型不匹配: 期望 {:?}, 找到 {:?}",
+                    expected, actual
+                ))
+            }
+        }
+    }
+}
+
+fn validate_condition(
+    expr: &Expr,
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, Type>,
+) -> Result<(), String> {
+    match validate_expr(expr, program, func, scoped_imports, locals)? {
         Type::Int | Type::Bool => Ok(()),
         other => Err(format!("条件表达式必须是整数或布尔，找到 {:?}", other)),
     }
 }
 
-fn validate_expr(expr: &Expr, locals: &HashMap<String, Type>) -> Result<Type, String> {
+fn validate_expr(
+    expr: &Expr,
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, Type>,
+) -> Result<Type, String> {
     match expr {
         Expr::IntLiteral(_) => Ok(Type::Int),
         Expr::Ident(name) => locals
             .get(name)
             .cloned()
             .ok_or_else(|| format!("未定义的变量: {}", name)),
+        Expr::Call { target, args } => {
+            let resolved = resolve_execute_target(program, func, scoped_imports, target)
+                .ok_or_else(|| format!("未找到模块或方法: {}", target))?;
+            let called_func = program
+                .functions
+                .iter()
+                .find(|candidate| function_path(candidate) == resolved)
+                .ok_or_else(|| format!("未找到方法: {}", resolved))?;
+            if called_func.return_type == Type::Void {
+                return Err(format!("方法没有返回值: {}", target));
+            }
+            if args.len() != called_func.params.len() {
+                return Err(format!(
+                    "方法 {} 需要 {} 个参数，找到 {} 个",
+                    target,
+                    called_func.params.len(),
+                    args.len()
+                ));
+            }
+            for (arg, param) in args.iter().zip(&called_func.params) {
+                let arg_type = validate_expr(arg, program, func, scoped_imports, locals)?;
+                if arg_type != param.param_type {
+                    return Err(format!(
+                        "方法 {} 的参数 {} 类型不匹配: 期望 {:?}, 找到 {:?}",
+                        target, param.name, param.param_type, arg_type
+                    ));
+                }
+            }
+            Ok(called_func.return_type.clone())
+        }
         Expr::StringLiteral(_) => Ok(Type::String),
         Expr::FormattedString(parts) => {
             for part in parts {
@@ -151,7 +301,7 @@ fn validate_expr(expr: &Expr, locals: &HashMap<String, Type>) -> Result<Type, St
             Ok(Type::String)
         }
         Expr::Unary { op, expr } => {
-            let ty = validate_expr(expr, locals)?;
+            let ty = validate_expr(expr, program, func, scoped_imports, locals)?;
             match (op, ty) {
                 (UnaryOp::Neg, Type::Int) => Ok(Type::Int),
                 (UnaryOp::Not, Type::Int | Type::Bool) => Ok(Type::Bool),
@@ -160,8 +310,8 @@ fn validate_expr(expr: &Expr, locals: &HashMap<String, Type>) -> Result<Type, St
             }
         }
         Expr::Binary { left, op, right } => {
-            let left_ty = validate_expr(left, locals)?;
-            let right_ty = validate_expr(right, locals)?;
+            let left_ty = validate_expr(left, program, func, scoped_imports, locals)?;
+            let right_ty = validate_expr(right, program, func, scoped_imports, locals)?;
             match op {
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
                     if left_ty == Type::Int && right_ty == Type::Int {
@@ -317,5 +467,25 @@ mod tests {
 
         let err = analyze(&program).expect_err("Expected semantic error");
         assert!(err.contains("未找到模块或方法"));
+    }
+
+    #[test]
+    fn test_assignment_and_return_in_count_loop() {
+        let source = "定义 方法 从零求和（结束值：整数）返回 整数：设 cnt = 0 循环计数i<结束值：cnt=cnt+1。。返回 cnt。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_function_call_expression_uses_return_type() {
+        let source = "定义 方法 从零求和（结束值：整数）返回 整数：返回 结束值。。定义 方法 测试（）返回 无：设 s = 从零求和（10）。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
     }
 }

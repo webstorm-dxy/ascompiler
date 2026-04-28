@@ -1,7 +1,7 @@
 /// Code generation: walks the AST and emits LLVM IR via inkwell.
 use crate::parser::{
-    BinaryOp, ExecuteStmt, Expr, FormatPart, FunctionDef, IfStmt, ImportDecl, Program, Stmt, Type,
-    UnaryOp, VarDecl,
+    AssignStmt, BinaryOp, ExecuteStmt, Expr, FormatPart, FunctionDef, IfStmt, ImportDecl, LoopStmt,
+    Program, ReturnStmt, Stmt, Type, UnaryOp, VarDecl,
 };
 use crate::semantic;
 use crate::stdlib;
@@ -19,7 +19,6 @@ use std::collections::HashMap;
 #[derive(Clone)]
 enum LocalValue<'ctx> {
     Pointer(PointerValue<'ctx>, Type),
-    Value(BasicValueEnum<'ctx>, Type),
 }
 
 /// Generate LLVM IR for the entire program.
@@ -147,14 +146,30 @@ fn compile_function<'ctx>(
     let mut locals = HashMap::new();
     for (i, param) in func.params.iter().enumerate() {
         if let Some(value) = function.get_nth_param(i as u32) {
+            let alloca = builder
+                .build_alloca(
+                    as_llvm_type(&param.param_type, context),
+                    &sanitize_llvm_name(&param.name),
+                )
+                .map_err(|e| format!("build_alloca failed: {:?}", e))?;
+            builder
+                .build_store(alloca, value)
+                .map_err(|e| format!("build_store failed: {:?}", e))?;
             locals.insert(
                 param.name.clone(),
-                LocalValue::Value(value, param.param_type.clone()),
+                LocalValue::Pointer(alloca, param.param_type.clone()),
             );
         }
     }
 
     for stmt in &func.body {
+        if builder
+            .get_insert_block()
+            .and_then(|block| block.get_terminator())
+            .is_some()
+        {
+            break;
+        }
         compile_stmt(
             stmt,
             func,
@@ -168,32 +183,38 @@ fn compile_function<'ctx>(
         )?;
     }
 
-    // Build return instruction
-    if func.is_entry || func.return_type == Type::Void {
-        let _ = builder.build_return(Some(&context.i32_type().const_int(0, false)));
-    } else {
-        match func.return_type {
-            Type::Int => {
-                let _ = builder.build_return(Some(&context.i32_type().const_int(0, false)));
+    if builder
+        .get_insert_block()
+        .and_then(|block| block.get_terminator())
+        .is_none()
+    {
+        // Build default return instruction
+        if func.is_entry || func.return_type == Type::Void {
+            let _ = builder.build_return(Some(&context.i32_type().const_int(0, false)));
+        } else {
+            match func.return_type {
+                Type::Int => {
+                    let _ = builder.build_return(Some(&context.i32_type().const_int(0, false)));
+                }
+                Type::Double => {
+                    let _ = builder.build_return(Some(&context.f64_type().const_float(0.0)));
+                }
+                Type::Float => {
+                    let _ = builder.build_return(Some(&context.f32_type().const_float(0.0)));
+                }
+                Type::Bool => {
+                    let _ = builder.build_return(Some(&context.bool_type().const_int(0, false)));
+                }
+                Type::Char => {
+                    let _ = builder.build_return(Some(&context.i8_type().const_int(0, false)));
+                }
+                Type::String => {
+                    let _ = builder.build_return(Some(
+                        &context.ptr_type(AddressSpace::from(0u16)).const_null(),
+                    ));
+                }
+                Type::Void => unreachable!(),
             }
-            Type::Double => {
-                let _ = builder.build_return(Some(&context.f64_type().const_float(0.0)));
-            }
-            Type::Float => {
-                let _ = builder.build_return(Some(&context.f32_type().const_float(0.0)));
-            }
-            Type::Bool => {
-                let _ = builder.build_return(Some(&context.bool_type().const_int(0, false)));
-            }
-            Type::Char => {
-                let _ = builder.build_return(Some(&context.i8_type().const_int(0, false)));
-            }
-            Type::String => {
-                let _ = builder.build_return(Some(
-                    &context.ptr_type(AddressSpace::from(0u16)).const_null(),
-                ));
-            }
-            Type::Void => unreachable!(),
         }
     }
 
@@ -213,7 +234,36 @@ fn compile_stmt<'ctx>(
     module: &Module<'ctx>,
 ) -> Result<(), String> {
     match stmt {
-        Stmt::VarDecl(var) => compile_var_decl(var, locals, builder, context, module),
+        Stmt::VarDecl(var) => compile_var_decl(
+            var,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
+        Stmt::Assign(assign) => compile_assign_stmt(
+            assign,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
+        Stmt::Return(ret) => compile_return_stmt(
+            ret,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
         Stmt::Import(import) => {
             scoped_imports.push(import.clone());
             Ok(())
@@ -239,12 +289,26 @@ fn compile_stmt<'ctx>(
             context,
             module,
         ),
+        Stmt::Loop(loop_stmt) => compile_loop_stmt(
+            loop_stmt,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            function,
+            builder,
+            context,
+            module,
+        ),
     }
 }
 
 /// Compile a variable declaration: alloca + store initializer.
 fn compile_var_decl<'ctx>(
     var: &VarDecl,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
     locals: &mut HashMap<String, LocalValue<'ctx>>,
     builder: &Builder<'ctx>,
     context: &'ctx Context,
@@ -253,7 +317,7 @@ fn compile_var_decl<'ctx>(
     // Determine the LLVM type
     let var_type = match &var.var_type {
         Some(t) => t.clone(),
-        None => infer_type_from_expr(&var.init, locals)?,
+        None => infer_type_from_expr(&var.init, current_func, program, scoped_imports, locals)?,
     };
     let llvm_type = as_llvm_type(&var_type, context);
 
@@ -264,11 +328,88 @@ fn compile_var_decl<'ctx>(
         .map_err(|e| format!("build_alloca failed: {:?}", e))?;
 
     // Compile initializer value and store
-    let value = compile_expr(&var.init, locals, builder, context, module)?;
+    let value = compile_expr(
+        &var.init,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
     let _ = builder.build_store(alloca, value);
     locals.insert(var.name.clone(), LocalValue::Pointer(alloca, var_type));
 
     Ok(())
+}
+
+fn compile_assign_stmt<'ctx>(
+    assign: &AssignStmt,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &mut HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(), String> {
+    let local = locals
+        .get(&assign.name)
+        .cloned()
+        .ok_or_else(|| format!("未定义的变量: {}", assign.name))?;
+    let LocalValue::Pointer(ptr, _) = local;
+    let value = compile_expr(
+        &assign.value,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
+    builder
+        .build_store(ptr, value)
+        .map(|_| ())
+        .map_err(|e| format!("build_store failed: {:?}", e))
+}
+
+fn compile_return_stmt<'ctx>(
+    ret: &ReturnStmt,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(), String> {
+    if current_func.is_entry || current_func.return_type == Type::Void {
+        return builder
+            .build_return(Some(&context.i32_type().const_int(0, false)))
+            .map(|_| ())
+            .map_err(|e| format!("build_return failed: {:?}", e));
+    }
+
+    let expr = ret
+        .value
+        .as_ref()
+        .ok_or_else(|| "返回语句缺少返回值".to_string())?;
+    let value = compile_expr(
+        expr,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
+    builder
+        .build_return(Some(&value))
+        .map(|_| ())
+        .map_err(|e| format!("build_return failed: {:?}", e))
 }
 
 fn compile_if_stmt<'ctx>(
@@ -306,7 +447,16 @@ fn compile_if_stmt<'ctx>(
             block
         };
 
-        let condition = compile_bool_expr(&branch.condition, locals, builder, context, module)?;
+        let condition = compile_bool_expr(
+            &branch.condition,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        )?;
         builder
             .build_conditional_branch(condition, then_block, else_block)
             .map_err(|e| format!("build_conditional_branch failed: {:?}", e))?;
@@ -372,9 +522,234 @@ fn compile_if_stmt<'ctx>(
     Ok(())
 }
 
+fn compile_loop_stmt<'ctx>(
+    loop_stmt: &LoopStmt,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &mut Vec<ImportDecl>,
+    locals: &mut HashMap<String, LocalValue<'ctx>>,
+    function: &FunctionValue<'ctx>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(), String> {
+    match loop_stmt {
+        LoopStmt::Count {
+            var_name,
+            end,
+            body,
+        } => compile_count_loop(
+            var_name,
+            end,
+            body,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            function,
+            builder,
+            context,
+            module,
+        ),
+        LoopStmt::Condition { condition, body } => compile_condition_loop(
+            condition,
+            body,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            function,
+            builder,
+            context,
+            module,
+        ),
+    }
+}
+
+fn compile_count_loop<'ctx>(
+    var_name: &str,
+    end: &Expr,
+    body: &[Stmt],
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &mut Vec<ImportDecl>,
+    locals: &mut HashMap<String, LocalValue<'ctx>>,
+    function: &FunctionValue<'ctx>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(), String> {
+    let sanitized_name = sanitize_llvm_name(var_name);
+    let counter_alloca = builder
+        .build_alloca(context.i32_type(), &sanitized_name)
+        .map_err(|e| format!("build_alloca failed: {:?}", e))?;
+    builder
+        .build_store(counter_alloca, context.i32_type().const_zero())
+        .map_err(|e| format!("build_store failed: {:?}", e))?;
+
+    let condition_block = context.append_basic_block(*function, "loop.count.cond");
+    let body_block = context.append_basic_block(*function, "loop.count.body");
+    let end_block = context.append_basic_block(*function, "loop.count.end");
+
+    builder
+        .build_unconditional_branch(condition_block)
+        .map_err(|e| format!("build_unconditional_branch failed: {:?}", e))?;
+
+    builder.position_at_end(condition_block);
+    let counter_value = builder
+        .build_load(
+            context.i32_type(),
+            counter_alloca,
+            &format!("load.{}", sanitized_name),
+        )
+        .map_err(|e| format!("build_load failed: {:?}", e))?
+        .into_int_value();
+    let end_value = compile_expr(
+        end,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?
+    .into_int_value();
+    let condition = builder
+        .build_int_compare(
+            IntPredicate::SLT,
+            counter_value,
+            end_value,
+            "loop.count.cmp",
+        )
+        .map_err(|e| format!("build_int_compare failed: {:?}", e))?;
+    builder
+        .build_conditional_branch(condition, body_block, end_block)
+        .map_err(|e| format!("build_conditional_branch failed: {:?}", e))?;
+
+    builder.position_at_end(body_block);
+    let mut loop_imports = scoped_imports.clone();
+    let mut loop_locals = locals.clone();
+    loop_locals.insert(
+        var_name.to_string(),
+        LocalValue::Pointer(counter_alloca, Type::Int),
+    );
+    for stmt in body {
+        compile_stmt(
+            stmt,
+            current_func,
+            program,
+            &mut loop_imports,
+            &mut loop_locals,
+            function,
+            builder,
+            context,
+            module,
+        )?;
+    }
+    if builder
+        .get_insert_block()
+        .and_then(|block| block.get_terminator())
+        .is_none()
+    {
+        let current_counter = builder
+            .build_load(
+                context.i32_type(),
+                counter_alloca,
+                &format!("load.{}", sanitized_name),
+            )
+            .map_err(|e| format!("build_load failed: {:?}", e))?
+            .into_int_value();
+        let next_counter = builder
+            .build_int_add(
+                current_counter,
+                context.i32_type().const_int(1, false),
+                "loop.count.next",
+            )
+            .map_err(|e| format!("build_int_add failed: {:?}", e))?;
+        builder
+            .build_store(counter_alloca, next_counter)
+            .map_err(|e| format!("build_store failed: {:?}", e))?;
+        builder
+            .build_unconditional_branch(condition_block)
+            .map_err(|e| format!("build_unconditional_branch failed: {:?}", e))?;
+    }
+
+    builder.position_at_end(end_block);
+    Ok(())
+}
+
+fn compile_condition_loop<'ctx>(
+    condition: &Expr,
+    body: &[Stmt],
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &mut Vec<ImportDecl>,
+    locals: &mut HashMap<String, LocalValue<'ctx>>,
+    function: &FunctionValue<'ctx>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(), String> {
+    let condition_block = context.append_basic_block(*function, "loop.condition.cond");
+    let body_block = context.append_basic_block(*function, "loop.condition.body");
+    let end_block = context.append_basic_block(*function, "loop.condition.end");
+
+    builder
+        .build_unconditional_branch(condition_block)
+        .map_err(|e| format!("build_unconditional_branch failed: {:?}", e))?;
+
+    builder.position_at_end(condition_block);
+    let condition_value = compile_bool_expr(
+        condition,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
+    builder
+        .build_conditional_branch(condition_value, body_block, end_block)
+        .map_err(|e| format!("build_conditional_branch failed: {:?}", e))?;
+
+    builder.position_at_end(body_block);
+    let mut loop_imports = scoped_imports.clone();
+    let mut loop_locals = locals.clone();
+    for stmt in body {
+        compile_stmt(
+            stmt,
+            current_func,
+            program,
+            &mut loop_imports,
+            &mut loop_locals,
+            function,
+            builder,
+            context,
+            module,
+        )?;
+    }
+    if builder
+        .get_insert_block()
+        .and_then(|block| block.get_terminator())
+        .is_none()
+    {
+        builder
+            .build_unconditional_branch(condition_block)
+            .map_err(|e| format!("build_unconditional_branch failed: {:?}", e))?;
+    }
+
+    builder.position_at_end(end_block);
+    Ok(())
+}
+
 /// Compile an expression, returning the LLVM value.
 fn compile_expr<'ctx>(
     expr: &Expr,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
     locals: &HashMap<String, LocalValue<'ctx>>,
     builder: &Builder<'ctx>,
     context: &'ctx Context,
@@ -388,6 +763,17 @@ fn compile_expr<'ctx>(
                 .ok_or_else(|| format!("未定义的变量: {}", name))?;
             load_local_value(local.clone(), name, builder, context)
         }
+        Expr::Call { target, args } => compile_call_expr(
+            target,
+            args,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
         Expr::StringLiteral(text) => {
             let global = builder
                 .build_global_string_ptr(text, "as.str")
@@ -398,7 +784,16 @@ fn compile_expr<'ctx>(
             compile_formatted_string(parts, locals, builder, context, module)
         }
         Expr::Unary { op, expr } => {
-            let value = compile_expr(expr, locals, builder, context, module)?;
+            let value = compile_expr(
+                expr,
+                current_func,
+                program,
+                scoped_imports,
+                locals,
+                builder,
+                context,
+                module,
+            )?;
             match op {
                 UnaryOp::Neg => {
                     let int_value = value.into_int_value();
@@ -407,20 +802,48 @@ fn compile_expr<'ctx>(
                         .map(Into::into)
                         .map_err(|e| format!("build_int_neg failed: {:?}", e))
                 }
-                UnaryOp::Not => compile_bool_expr(expr, locals, builder, context, module).and_then(
-                    |bool_value| {
-                        builder
-                            .build_not(bool_value, "nottmp")
-                            .map(Into::into)
-                            .map_err(|e| format!("build_not failed: {:?}", e))
-                    },
-                ),
+                UnaryOp::Not => compile_bool_expr(
+                    expr,
+                    current_func,
+                    program,
+                    scoped_imports,
+                    locals,
+                    builder,
+                    context,
+                    module,
+                )
+                .and_then(|bool_value| {
+                    builder
+                        .build_not(bool_value, "nottmp")
+                        .map(Into::into)
+                        .map_err(|e| format!("build_not failed: {:?}", e))
+                }),
             }
         }
         Expr::Binary { left, op, right } => match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
-                let lhs = compile_expr(left, locals, builder, context, module)?.into_int_value();
-                let rhs = compile_expr(right, locals, builder, context, module)?.into_int_value();
+                let lhs = compile_expr(
+                    left,
+                    current_func,
+                    program,
+                    scoped_imports,
+                    locals,
+                    builder,
+                    context,
+                    module,
+                )?
+                .into_int_value();
+                let rhs = compile_expr(
+                    right,
+                    current_func,
+                    program,
+                    scoped_imports,
+                    locals,
+                    builder,
+                    context,
+                    module,
+                )?
+                .into_int_value();
                 let result = match op {
                     BinaryOp::Add => builder.build_int_add(lhs, rhs, "addtmp"),
                     BinaryOp::Sub => builder.build_int_sub(lhs, rhs, "subtmp"),
@@ -439,8 +862,28 @@ fn compile_expr<'ctx>(
             | BinaryOp::LessEq
             | BinaryOp::Greater
             | BinaryOp::GreaterEq => {
-                let lhs = compile_expr(left, locals, builder, context, module)?.into_int_value();
-                let rhs = compile_expr(right, locals, builder, context, module)?.into_int_value();
+                let lhs = compile_expr(
+                    left,
+                    current_func,
+                    program,
+                    scoped_imports,
+                    locals,
+                    builder,
+                    context,
+                    module,
+                )?
+                .into_int_value();
+                let rhs = compile_expr(
+                    right,
+                    current_func,
+                    program,
+                    scoped_imports,
+                    locals,
+                    builder,
+                    context,
+                    module,
+                )?
+                .into_int_value();
                 let pred = match op {
                     BinaryOp::Eq => IntPredicate::EQ,
                     BinaryOp::NotEq => IntPredicate::NE,
@@ -455,23 +898,92 @@ fn compile_expr<'ctx>(
                     .map(Into::into)
                     .map_err(|e| format!("build_int_compare failed: {:?}", e))
             }
-            BinaryOp::And | BinaryOp::Or => {
-                compile_logical_expr(left, op, right, locals, builder, context, module)
-            }
+            BinaryOp::And | BinaryOp::Or => compile_logical_expr(
+                left,
+                op,
+                right,
+                current_func,
+                program,
+                scoped_imports,
+                locals,
+                builder,
+                context,
+                module,
+            ),
         },
     }
+}
+
+fn compile_call_expr<'ctx>(
+    target: &str,
+    args: &[Expr],
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, String> {
+    let resolved = semantic::resolve_execute_target(program, current_func, scoped_imports, target)
+        .ok_or_else(|| format!("未找到模块或方法: {}", target))?;
+    let called_func = program
+        .functions
+        .iter()
+        .find(|func| semantic::function_path(func) == resolved)
+        .ok_or_else(|| format!("未找到方法: {}", resolved))?;
+    if called_func.return_type == Type::Void {
+        return Err(format!("方法没有返回值: {}", target));
+    }
+    let function = module
+        .get_function(&llvm_function_name(called_func))
+        .ok_or_else(|| format!("未找到方法: {}", resolved))?;
+    let call_args: Vec<BasicMetadataValueEnum> = args
+        .iter()
+        .map(|arg| {
+            compile_expr(
+                arg,
+                current_func,
+                program,
+                scoped_imports,
+                locals,
+                builder,
+                context,
+                module,
+            )
+            .map(Into::into)
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok(builder
+        .build_call(function, &call_args, "call.value")
+        .map_err(|e| format!("build_call failed: {:?}", e))?
+        .try_as_basic_value()
+        .unwrap_basic())
 }
 
 fn compile_logical_expr<'ctx>(
     left: &Expr,
     op: &BinaryOp,
     right: &Expr,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
     locals: &HashMap<String, LocalValue<'ctx>>,
     builder: &Builder<'ctx>,
     context: &'ctx Context,
     module: &Module<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>, String> {
-    let left_value = compile_bool_expr(left, locals, builder, context, module)?;
+    let left_value = compile_bool_expr(
+        left,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
     let left_block = builder
         .get_insert_block()
         .ok_or_else(|| "Missing insert block for logical expression".to_string())?;
@@ -492,7 +1004,16 @@ fn compile_logical_expr<'ctx>(
     };
 
     builder.position_at_end(right_block);
-    let right_value = compile_bool_expr(right, locals, builder, context, module)?;
+    let right_value = compile_bool_expr(
+        right,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
     let right_end_block = builder
         .get_insert_block()
         .ok_or_else(|| "Missing right-hand block for logical expression".to_string())?;
@@ -515,12 +1036,25 @@ fn compile_logical_expr<'ctx>(
 
 fn compile_bool_expr<'ctx>(
     expr: &Expr,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
     locals: &HashMap<String, LocalValue<'ctx>>,
     builder: &Builder<'ctx>,
     context: &'ctx Context,
     module: &Module<'ctx>,
 ) -> Result<inkwell::values::IntValue<'ctx>, String> {
-    let value = compile_expr(expr, locals, builder, context, module)?.into_int_value();
+    let value = compile_expr(
+        expr,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?
+    .into_int_value();
     if value.get_type().get_bit_width() == 1 {
         Ok(value)
     } else {
@@ -538,6 +1072,9 @@ fn compile_bool_expr<'ctx>(
 /// Infer LLVM type from an expression (for type inference).
 fn infer_type_from_expr<'ctx>(
     expr: &Expr,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
     locals: &HashMap<String, LocalValue<'ctx>>,
 ) -> Result<Type, String> {
     match expr {
@@ -546,6 +1083,17 @@ fn infer_type_from_expr<'ctx>(
             .get(name)
             .map(local_type)
             .ok_or_else(|| format!("未定义的变量: {}", name)),
+        Expr::Call { target, .. } => {
+            let resolved =
+                semantic::resolve_execute_target(program, current_func, scoped_imports, target)
+                    .ok_or_else(|| format!("未找到模块或方法: {}", target))?;
+            program
+                .functions
+                .iter()
+                .find(|func| semantic::function_path(func) == resolved)
+                .map(|func| func.return_type.clone())
+                .ok_or_else(|| format!("未找到方法: {}", resolved))
+        }
         Expr::StringLiteral(_) | Expr::FormattedString(_) => {
             if let Expr::FormattedString(parts) = expr {
                 for part in parts {
@@ -559,7 +1107,9 @@ fn infer_type_from_expr<'ctx>(
             Ok(Type::String)
         }
         Expr::Unary { op, expr } => match op {
-            UnaryOp::Neg => infer_type_from_expr(expr, locals),
+            UnaryOp::Neg => {
+                infer_type_from_expr(expr, current_func, program, scoped_imports, locals)
+            }
             UnaryOp::Not => Ok(Type::Bool),
         },
         Expr::Binary { op, .. } => match op {
@@ -630,7 +1180,7 @@ fn compile_formatted_string<'ctx>(
 
 fn local_type<'ctx>(local: &LocalValue<'ctx>) -> Type {
     match local {
-        LocalValue::Pointer(_, ty) | LocalValue::Value(_, ty) => ty.clone(),
+        LocalValue::Pointer(_, ty) => ty.clone(),
     }
 }
 
@@ -648,7 +1198,6 @@ fn load_local_value<'ctx>(
                 &format!("load.{}", sanitize_llvm_name(name)),
             )
             .map_err(|e| format!("build_load failed: {:?}", e)),
-        LocalValue::Value(value, _) => Ok(value),
     }
 }
 
@@ -689,7 +1238,19 @@ fn compile_execute<'ctx>(
     let args: Vec<BasicMetadataValueEnum> = exec
         .args
         .iter()
-        .map(|arg| compile_expr(arg, locals, builder, context, module).map(Into::into))
+        .map(|arg| {
+            compile_expr(
+                arg,
+                current_func,
+                program,
+                scoped_imports,
+                locals,
+                builder,
+                context,
+                module,
+            )
+            .map(Into::into)
+        })
         .collect::<Result<_, _>>()?;
 
     builder
