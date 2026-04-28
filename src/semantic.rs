@@ -4,6 +4,12 @@ use crate::parser::{
 };
 use std::collections::{HashMap, HashSet};
 
+#[derive(Clone, Debug)]
+struct LocalInfo {
+    ty: Type,
+    is_mutable: bool,
+}
+
 #[derive(Debug)]
 struct ModuleRegistry {
     modules: HashSet<String>,
@@ -40,10 +46,18 @@ pub fn analyze(program: &Program) -> Result<(), String> {
 
     for func in &program.functions {
         let mut scoped_imports = program.imports.clone();
-        let mut locals: HashMap<String, Type> = func
+        let mut locals: HashMap<String, LocalInfo> = func
             .params
             .iter()
-            .map(|param| (param.name.clone(), param.param_type.clone()))
+            .map(|param| {
+                (
+                    param.name.clone(),
+                    LocalInfo {
+                        ty: param.param_type.clone(),
+                        is_mutable: false,
+                    },
+                )
+            })
             .collect();
 
         for stmt in &func.body {
@@ -67,7 +81,7 @@ fn validate_stmt(
     func: &FunctionDef,
     registry: &ModuleRegistry,
     scoped_imports: &mut Vec<ImportDecl>,
-    locals: &mut HashMap<String, Type>,
+    locals: &mut HashMap<String, LocalInfo>,
 ) -> Result<(), String> {
     match stmt {
         Stmt::Import(import) => {
@@ -140,7 +154,13 @@ fn validate_stmt(
                 }
 
                 let mut loop_locals = locals.clone();
-                loop_locals.insert(var_name.clone(), Type::Int);
+                loop_locals.insert(
+                    var_name.clone(),
+                    LocalInfo {
+                        ty: Type::Int,
+                        is_mutable: false,
+                    },
+                );
                 let mut loop_imports = scoped_imports.clone();
                 for stmt in body {
                     validate_stmt(
@@ -178,11 +198,17 @@ fn validate_var_decl(
     program: &Program,
     func: &FunctionDef,
     scoped_imports: &[ImportDecl],
-    locals: &mut HashMap<String, Type>,
+    locals: &mut HashMap<String, LocalInfo>,
 ) -> Result<(), String> {
     let inferred_type = validate_expr(&var.init, program, func, scoped_imports, locals)?;
     let var_type = var.var_type.clone().unwrap_or(inferred_type);
-    locals.insert(var.name.clone(), var_type);
+    locals.insert(
+        var.name.clone(),
+        LocalInfo {
+            ty: var_type,
+            is_mutable: var.is_mutable,
+        },
+    );
     Ok(())
 }
 
@@ -191,18 +217,21 @@ fn validate_assign_stmt(
     program: &Program,
     func: &FunctionDef,
     scoped_imports: &[ImportDecl],
-    locals: &HashMap<String, Type>,
+    locals: &HashMap<String, LocalInfo>,
 ) -> Result<(), String> {
-    let target_type = locals
+    let target = locals
         .get(&assign.name)
         .ok_or_else(|| format!("未定义的变量: {}", assign.name))?;
+    if !target.is_mutable {
+        return Err(format!("不可变变量不能重新赋值: {}", assign.name));
+    }
     let value_type = validate_expr(&assign.value, program, func, scoped_imports, locals)?;
-    if &value_type == target_type {
+    if value_type == target.ty {
         Ok(())
     } else {
         Err(format!(
             "赋值类型不匹配: {} 是 {:?}, 但表达式是 {:?}",
-            assign.name, target_type, value_type
+            assign.name, target.ty, value_type
         ))
     }
 }
@@ -213,7 +242,7 @@ fn validate_return_stmt(
     program: &Program,
     func: &FunctionDef,
     scoped_imports: &[ImportDecl],
-    locals: &HashMap<String, Type>,
+    locals: &HashMap<String, LocalInfo>,
 ) -> Result<(), String> {
     match (&ret.value, expected_type) {
         (None, Type::Void) => Ok(()),
@@ -238,7 +267,7 @@ fn validate_condition(
     program: &Program,
     func: &FunctionDef,
     scoped_imports: &[ImportDecl],
-    locals: &HashMap<String, Type>,
+    locals: &HashMap<String, LocalInfo>,
 ) -> Result<(), String> {
     match validate_expr(expr, program, func, scoped_imports, locals)? {
         Type::Int | Type::Bool => Ok(()),
@@ -251,13 +280,13 @@ fn validate_expr(
     program: &Program,
     func: &FunctionDef,
     scoped_imports: &[ImportDecl],
-    locals: &HashMap<String, Type>,
+    locals: &HashMap<String, LocalInfo>,
 ) -> Result<Type, String> {
     match expr {
         Expr::IntLiteral(_) => Ok(Type::Int),
         Expr::Ident(name) => locals
             .get(name)
-            .cloned()
+            .map(|local| local.ty.clone())
             .ok_or_else(|| format!("未定义的变量: {}", name)),
         Expr::Call { target, args } => {
             let resolved = resolve_execute_target(program, func, scoped_imports, target)
@@ -472,6 +501,27 @@ mod tests {
     #[test]
     fn test_assignment_and_return_in_count_loop() {
         let source = "定义 方法 从零求和（结束值：整数）返回 整数：设 cnt = 0 循环计数i<结束值：cnt=cnt+1。。返回 cnt。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_define_variable_is_immutable_by_default() {
+        let source = "定义 方法 测试（）返回 无：定义 变量：cnt = 0 cnt = 1。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        let err = analyze(&program).expect_err("Expected immutable assignment error");
+        assert!(err.contains("不可变变量不能重新赋值"));
+    }
+
+    #[test]
+    fn test_define_mutable_variable_allows_assignment() {
+        let source = "定义 方法 测试（）返回 无：定义 可变 变量：cnt = 0 cnt = 1。。";
         let program = Parser::new(Lexer::new(source))
             .parse_program()
             .expect("Parse failed");

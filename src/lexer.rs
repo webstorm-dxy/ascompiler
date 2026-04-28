@@ -37,6 +37,7 @@ pub enum Token {
 
     // Variable definition
     Variable, // 变量
+    Mutable,  // 可变
     Let,      // 设 (simplified variable definition)
 
     // Modules and calls
@@ -173,6 +174,7 @@ impl Lexer {
                     ['布', '尔'] => Some(Token::BoolKw),
                     ['字', '符'] => Some(Token::CharKw),
                     ['变', '量'] => Some(Token::Variable),
+                    ['可', '变'] => Some(Token::Mutable),
                     ['整', '型'] => Some(Token::IntTypeKw),
                     _ => None,
                 };
@@ -261,6 +263,7 @@ impl Lexer {
                         | ['布', '尔']
                         | ['字', '符']
                         | ['变', '量']
+                        | ['可', '变']
                         | ['整', '型']
                 ) {
                     return true;

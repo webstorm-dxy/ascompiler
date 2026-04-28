@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 #[derive(Clone)]
 enum LocalValue<'ctx> {
-    Pointer(PointerValue<'ctx>, Type),
+    Pointer(PointerValue<'ctx>, Type, bool),
 }
 
 /// Generate LLVM IR for the entire program.
@@ -157,7 +157,7 @@ fn compile_function<'ctx>(
                 .map_err(|e| format!("build_store failed: {:?}", e))?;
             locals.insert(
                 param.name.clone(),
-                LocalValue::Pointer(alloca, param.param_type.clone()),
+                LocalValue::Pointer(alloca, param.param_type.clone(), false),
             );
         }
     }
@@ -339,7 +339,10 @@ fn compile_var_decl<'ctx>(
         module,
     )?;
     let _ = builder.build_store(alloca, value);
-    locals.insert(var.name.clone(), LocalValue::Pointer(alloca, var_type));
+    locals.insert(
+        var.name.clone(),
+        LocalValue::Pointer(alloca, var_type, var.is_mutable),
+    );
 
     Ok(())
 }
@@ -358,7 +361,10 @@ fn compile_assign_stmt<'ctx>(
         .get(&assign.name)
         .cloned()
         .ok_or_else(|| format!("未定义的变量: {}", assign.name))?;
-    let LocalValue::Pointer(ptr, _) = local;
+    let LocalValue::Pointer(ptr, _, is_mutable) = local;
+    if !is_mutable {
+        return Err(format!("不可变变量不能重新赋值: {}", assign.name));
+    }
     let value = compile_expr(
         &assign.value,
         current_func,
@@ -632,7 +638,7 @@ fn compile_count_loop<'ctx>(
     let mut loop_locals = locals.clone();
     loop_locals.insert(
         var_name.to_string(),
-        LocalValue::Pointer(counter_alloca, Type::Int),
+        LocalValue::Pointer(counter_alloca, Type::Int, false),
     );
     for stmt in body {
         compile_stmt(
@@ -1180,7 +1186,7 @@ fn compile_formatted_string<'ctx>(
 
 fn local_type<'ctx>(local: &LocalValue<'ctx>) -> Type {
     match local {
-        LocalValue::Pointer(_, ty) => ty.clone(),
+        LocalValue::Pointer(_, ty, _) => ty.clone(),
     }
 }
 
@@ -1191,7 +1197,7 @@ fn load_local_value<'ctx>(
     context: &'ctx Context,
 ) -> Result<BasicValueEnum<'ctx>, String> {
     match local {
-        LocalValue::Pointer(ptr, ty) => builder
+        LocalValue::Pointer(ptr, ty, _) => builder
             .build_load(
                 as_llvm_type(&ty, context),
                 ptr,

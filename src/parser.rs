@@ -79,6 +79,8 @@ pub struct VarDecl {
     pub name: String,
     /// Optional explicit type (None = type inferred from initializer).
     pub var_type: Option<Type>,
+    /// True when the variable can be assigned after declaration.
+    pub is_mutable: bool,
     /// Initializer expression.
     pub init: Expr,
 }
@@ -536,9 +538,15 @@ impl Parser {
         }
     }
 
-    /// Parse a variable declaration: `定义 变量： [type] name = expr`
+    /// Parse a variable declaration: `定义 [可变] 变量： [type] name = expr`
     fn parse_var_decl(&mut self) -> Result<VarDecl, String> {
         self.expect(&Token::Define)?;
+        let is_mutable = if self.current == Token::Mutable {
+            self.advance();
+            true
+        } else {
+            false
+        };
         self.expect(&Token::Variable)?;
         self.expect(&Token::Colon)?;
 
@@ -555,11 +563,13 @@ impl Parser {
         Ok(VarDecl {
             name,
             var_type,
+            is_mutable,
             init,
         })
     }
 
-    /// Parse a simplified variable declaration: `设 name = expr`
+    /// Parse a simplified variable declaration: `设 name = expr`.
+    /// `设` variables are mutable by default.
     fn parse_let_stmt(&mut self) -> Result<VarDecl, String> {
         self.expect(&Token::Let)?;
         let name = self.expect_ident()?;
@@ -569,6 +579,7 @@ impl Parser {
         Ok(VarDecl {
             name,
             var_type: None,
+            is_mutable: true,
             init,
         })
     }
@@ -924,6 +935,7 @@ mod tests {
             Stmt::VarDecl(v) => {
                 assert_eq!(v.name, "x");
                 assert_eq!(v.var_type, None);
+                assert!(!v.is_mutable);
                 assert_eq!(v.init, Expr::IntLiteral(10));
             }
             other => panic!("Expected VarDecl, found {:?}", other),
@@ -943,6 +955,7 @@ mod tests {
             Stmt::VarDecl(v) => {
                 assert_eq!(v.name, "y");
                 assert_eq!(v.var_type, Some(Type::Int));
+                assert!(!v.is_mutable);
                 assert_eq!(v.init, Expr::IntLiteral(20));
             }
             other => panic!("Expected VarDecl, found {:?}", other),
@@ -962,6 +975,7 @@ mod tests {
             Stmt::VarDecl(v) => {
                 assert_eq!(v.name, "z");
                 assert_eq!(v.var_type, None);
+                assert!(v.is_mutable);
                 assert_eq!(v.init, Expr::IntLiteral(30));
             }
             other => panic!("Expected VarDecl, found {:?}", other),
@@ -981,7 +995,27 @@ mod tests {
             Stmt::VarDecl(v) => {
                 assert_eq!(v.name, "x");
                 assert_eq!(v.var_type, None);
+                assert!(!v.is_mutable);
                 assert_eq!(v.init, Expr::IntLiteral(10));
+            }
+            other => panic!("Expected VarDecl, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_mutable_var_decl_no_space_between_keywords() {
+        let source = "定义 方法 测试（）返回 无：定义可变变量：cnt=0。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        assert_eq!(func.body.len(), 1);
+        match &func.body[0] {
+            Stmt::VarDecl(v) => {
+                assert_eq!(v.name, "cnt");
+                assert!(v.is_mutable);
+                assert_eq!(v.init, Expr::IntLiteral(0));
             }
             other => panic!("Expected VarDecl, found {:?}", other),
         }
