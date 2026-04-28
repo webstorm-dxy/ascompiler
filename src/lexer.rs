@@ -6,9 +6,10 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Annotations
-    At,      // @
-    Declare, // 声明
-    Entry,   // 入口
+    At,       // @
+    Declare,  // 声明
+    Entry,    // 入口
+    External, // 外部
 
     // Definitions
     Define, // 定义
@@ -25,6 +26,7 @@ pub enum Token {
     FloatKw,   // 浮点
     BoolKw,    // 布尔
     CharKw,    // 字符
+    StringKw,  // 字符串
     IntTypeKw, // 整型 (integer type, used in variable declarations)
 
     // Variable definition
@@ -112,13 +114,27 @@ impl Lexer {
             return None;
         }
 
-        // Check 2-char keywords first
+        // Check longer keywords first.
+        if let (Some(ch2), Some(ch3)) = (self.peek(1), self.peek(2)) {
+            if Self::is_cjk_ideograph(ch2) && Self::is_cjk_ideograph(ch3) {
+                let triple = [ch1, ch2, ch3];
+                if triple == ['字', '符', '串'] {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    return Some(Token::StringKw);
+                }
+            }
+        }
+
+        // Check 2-char keywords.
         if let Some(ch2) = self.peek(1) {
             if Self::is_cjk_ideograph(ch2) {
                 let pair = [ch1, ch2];
                 let token_opt = match pair {
                     ['声', '明'] => Some(Token::Declare),
                     ['入', '口'] => Some(Token::Entry),
+                    ['外', '部'] => Some(Token::External),
                     ['定', '义'] => Some(Token::Define),
                     ['方', '法'] => Some(Token::Method),
                     ['模', '块'] => Some(Token::Module),
@@ -171,6 +187,16 @@ impl Lexer {
             return false;
         }
 
+        // Check longer keywords first.
+        if let (Some(ch2), Some(ch3)) = (self.peek(1), self.peek(2)) {
+            if Self::is_cjk_ideograph(ch2)
+                && Self::is_cjk_ideograph(ch3)
+                && [ch1, ch2, ch3] == ['字', '符', '串']
+            {
+                return true;
+            }
+        }
+
         // Check 2-char keywords
         if let Some(ch2) = self.peek(1) {
             if Self::is_cjk_ideograph(ch2) {
@@ -179,6 +205,7 @@ impl Lexer {
                     pair,
                     ['声', '明']
                         | ['入', '口']
+                        | ['外', '部']
                         | ['定', '义']
                         | ['方', '法']
                         | ['模', '块']
@@ -441,5 +468,26 @@ mod tests {
         assert_eq!(lexer.next_token(), Token::Ident("输出".to_string()));
         assert_eq!(lexer.next_token(), Token::Colon);
         assert_eq!(lexer.next_token(), Token::StringLiteral("你好".to_string()));
+    }
+
+    #[test]
+    fn test_external_declaration_and_string_type() {
+        let source = "@声明 外部\n定义 方法 输出（内容：字符串）返回 无";
+        let mut lexer = Lexer::new(source);
+
+        assert_eq!(lexer.next_token(), Token::At);
+        assert_eq!(lexer.next_token(), Token::Declare);
+        assert_eq!(lexer.next_token(), Token::External);
+        assert_eq!(lexer.next_token(), Token::Define);
+        assert_eq!(lexer.next_token(), Token::Method);
+        assert_eq!(lexer.next_token(), Token::Ident("输出".to_string()));
+        assert_eq!(lexer.next_token(), Token::LParen);
+        assert_eq!(lexer.next_token(), Token::Ident("内容".to_string()));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::StringKw);
+        assert_eq!(lexer.next_token(), Token::RParen);
+        assert_eq!(lexer.next_token(), Token::ReturnKw);
+        assert_eq!(lexer.next_token(), Token::VoidKw);
+        assert_eq!(lexer.next_token(), Token::Eof);
     }
 }

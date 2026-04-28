@@ -2,6 +2,7 @@ mod codegen;
 mod lexer;
 mod parser;
 mod semantic;
+mod stdlib;
 
 use inkwell::context::Context;
 use inkwell::targets::{
@@ -55,6 +56,13 @@ fn main() {
         Ok(ast) => ast,
         Err(e) => {
             eprintln!("解析错误: {}", e);
+            process::exit(1);
+        }
+    };
+    let program = match stdlib::merge_with_standard_library(program) {
+        Ok(program) => program,
+        Err(e) => {
+            eprintln!("标准库解析错误: {}", e);
             process::exit(1);
         }
     };
@@ -115,6 +123,7 @@ fn main() {
     // --- Link to executable ---
     let status = Command::new("cc")
         .arg(&obj_path)
+        .arg(runtime_source_path())
         .arg("-o")
         .arg(&output_path)
         .status()
@@ -130,6 +139,10 @@ fn main() {
     let _ = fs::remove_file(&obj_path);
 
     println!("编译成功 → {}", output_path.display());
+}
+
+fn runtime_source_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/std_io.c")
 }
 
 /// Parse `-o <output>` from arguments.

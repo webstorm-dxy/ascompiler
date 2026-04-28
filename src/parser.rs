@@ -39,6 +39,8 @@ pub struct FunctionDef {
     pub return_type: Type,
     /// True if this function is the program entry point (main).
     pub is_entry: bool,
+    /// True if this function is implemented outside 问源 source.
+    pub is_external: bool,
     /// Function body statements.
     pub body: Vec<Stmt>,
 }
@@ -86,6 +88,7 @@ pub enum Type {
     Float,
     Bool,
     Char,
+    String,
 }
 
 impl Type {
@@ -97,6 +100,7 @@ impl Type {
             Token::FloatKw => Some(Type::Float),
             Token::BoolKw => Some(Type::Bool),
             Token::CharKw => Some(Type::Char),
+            Token::StringKw => Some(Type::String),
             Token::IntTypeKw => Some(Type::Int),
             _ => None,
         }
@@ -114,6 +118,8 @@ pub struct Parser {
     next_is_entry: bool,
     /// Whether this program has an entry point defined.
     has_entry: bool,
+    /// When true, the next function definition is an external declaration.
+    next_is_external: bool,
     /// Current module path for following top-level function definitions.
     current_module: Option<String>,
 }
@@ -127,6 +133,7 @@ impl Parser {
             current,
             next_is_entry: false,
             has_entry: false,
+            next_is_external: false,
             current_module: None,
         }
     }
@@ -232,6 +239,11 @@ impl Parser {
                 self.next_is_entry = true;
                 Ok(())
             }
+            Token::External => {
+                self.advance();
+                self.next_is_external = true;
+                Ok(())
+            }
             other => Err(format!("Expected 入口 after @声明, found {:?}", other)),
         }
     }
@@ -264,12 +276,6 @@ impl Parser {
         self.expect(&Token::ReturnKw)?;
         let return_type = self.parse_type()?;
 
-        // Scope start: : or ：
-        self.expect(&Token::Colon)?;
-
-        // Parse function body
-        let body = self.parse_body()?;
-
         // Determine if this is the entry point
         let is_entry = self.next_is_entry;
         if is_entry {
@@ -277,12 +283,27 @@ impl Parser {
             self.next_is_entry = false;
         }
 
+        let is_external = self.next_is_external;
+        if is_external {
+            self.next_is_external = false;
+        }
+
+        let body = if is_external {
+            Vec::new()
+        } else {
+            // Scope start: : or ：
+            self.expect(&Token::Colon)?;
+            // Parse function body
+            self.parse_body()?
+        };
+
         Ok(FunctionDef {
             name,
             module_path: self.current_module.clone(),
             params,
             return_type,
             is_entry,
+            is_external,
             body,
         })
     }
@@ -603,5 +624,24 @@ mod tests {
             }
             other => panic!("Expected Execute, found {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_external_function_declaration() {
+        let source = "#模块 标准库-输入输出\n@声明 外部\n定义 方法 输出（内容：字符串）返回 无";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        assert_eq!(program.modules[0].name, "标准库-输入输出");
+        assert_eq!(program.functions.len(), 1);
+
+        let func = &program.functions[0];
+        assert_eq!(func.module_path, Some("标准库-输入输出".to_string()));
+        assert_eq!(func.name, "输出");
+        assert!(func.is_external);
+        assert!(!func.is_entry);
+        assert!(func.body.is_empty());
+        assert_eq!(func.params[0].param_type, Type::String);
     }
 }

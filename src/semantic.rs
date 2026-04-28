@@ -1,9 +1,6 @@
 use crate::parser::{FunctionDef, ImportDecl, Program, Stmt};
 use std::collections::HashSet;
 
-pub const STD_IO_MODULE: &str = "标准库-输入输出";
-pub const STD_OUTPUT_FUNCTION: &str = "标准库-输入输出-输出";
-
 #[derive(Debug)]
 struct ModuleRegistry {
     modules: HashSet<String>,
@@ -12,8 +9,8 @@ struct ModuleRegistry {
 
 impl ModuleRegistry {
     fn from_program(program: &Program) -> Self {
-        let mut modules = HashSet::from([STD_IO_MODULE.to_string()]);
-        let mut callables = HashSet::from([STD_OUTPUT_FUNCTION.to_string()]);
+        let mut modules = HashSet::new();
+        let mut callables = HashSet::new();
 
         for module in &program.modules {
             modules.insert(module.name.clone());
@@ -139,6 +136,7 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+    use crate::stdlib;
 
     #[test]
     fn test_alias_resolves_standard_output() {
@@ -146,12 +144,13 @@ mod tests {
         let program = Parser::new(Lexer::new(source))
             .parse_program()
             .expect("Parse failed");
+        let program = stdlib::merge_with_standard_library(program).expect("std merge failed");
 
         analyze(&program).expect("Semantic analysis failed");
-        let func = &program.functions[0];
+        let func = program.functions.iter().find(|f| f.name == "测试").unwrap();
         let resolved = resolve_execute_target(&program, func, &program.imports, "输出")
             .expect("Resolve failed");
-        assert_eq!(resolved, STD_OUTPUT_FUNCTION);
+        assert_eq!(resolved, stdlib::STD_IO_OUTPUT_PATH);
     }
 
     #[test]

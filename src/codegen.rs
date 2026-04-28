@@ -1,6 +1,7 @@
 /// Code generation: walks the AST and emits LLVM IR via inkwell.
 use crate::parser::{ExecuteStmt, Expr, FunctionDef, ImportDecl, Program, Stmt, Type, VarDecl};
-use crate::semantic::{self, STD_OUTPUT_FUNCTION};
+use crate::semantic;
+use crate::stdlib;
 use inkwell::AddressSpace;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -16,7 +17,6 @@ pub fn generate<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
 ) -> Result<(), String> {
-    declare_standard_library(context, module);
     for func in &program.functions {
         declare_function(func, context, module)?;
     }
@@ -35,6 +35,7 @@ fn as_llvm_type<'ctx>(ty: &Type, context: &'ctx Context) -> BasicTypeEnum<'ctx> 
         Type::Float => context.f32_type().into(),
         Type::Bool => context.bool_type().into(),
         Type::Char => context.i8_type().into(),
+        Type::String => context.ptr_type(AddressSpace::from(0u16)).into(),
     }
 }
 
@@ -67,16 +68,11 @@ fn sanitize_llvm_name(name: &str) -> String {
 fn llvm_function_name(func: &FunctionDef) -> String {
     if func.is_entry {
         "main".to_string()
+    } else if func.is_external {
+        stdlib::external_symbol_for(&semantic::function_path(func))
+            .unwrap_or_else(|| sanitize_llvm_name(&semantic::function_path(func)))
     } else {
         sanitize_llvm_name(&semantic::function_path(func))
-    }
-}
-
-fn declare_standard_library<'ctx>(context: &'ctx Context, module: &Module<'ctx>) {
-    if module.get_function("puts").is_none() {
-        let ptr_type = context.ptr_type(AddressSpace::from(0u16));
-        let puts_type = context.i32_type().fn_type(&[ptr_type.into()], false);
-        module.add_function("puts", puts_type, None);
     }
 }
 
@@ -113,6 +109,10 @@ fn compile_function<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
 ) -> Result<(), String> {
+    if func.is_external {
+        return Ok(());
+    }
+
     let builder = context.create_builder();
 
     let llvm_name = llvm_function_name(func);
@@ -165,6 +165,11 @@ fn compile_function<'ctx>(
             }
             Type::Char => {
                 let _ = builder.build_return(Some(&context.i8_type().const_int(0, false)));
+            }
+            Type::String => {
+                let _ = builder.build_return(Some(
+                    &context.ptr_type(AddressSpace::from(0u16)).const_null(),
+                ));
             }
             Type::Void => unreachable!(),
         }
@@ -221,18 +226,25 @@ fn compile_var_decl<'ctx>(
         .map_err(|e| format!("build_alloca failed: {:?}", e))?;
 
     // Compile initializer value and store
-    let value = compile_expr(&var.init, context)?;
+    let value = compile_expr(&var.init, builder, context)?;
     let _ = builder.build_store(alloca, value);
 
     Ok(())
 }
 
 /// Compile an expression, returning the LLVM value.
-fn compile_expr<'ctx>(expr: &Expr, context: &'ctx Context) -> Result<BasicValueEnum<'ctx>, String> {
+fn compile_expr<'ctx>(
+    expr: &Expr,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+) -> Result<BasicValueEnum<'ctx>, String> {
     match expr {
         Expr::IntLiteral(val) => Ok(context.i32_type().const_int(*val as u64, true).into()),
-        Expr::StringLiteral(_) => {
-            Err("String literals are only supported as execute arguments".to_string())
+        Expr::StringLiteral(text) => {
+            let global = builder
+                .build_global_string_ptr(text, "as.str")
+                .map_err(|e| format!("build_global_string_ptr failed: {:?}", e))?;
+            Ok(global.as_pointer_value().into())
         }
     }
 }
@@ -258,10 +270,6 @@ fn compile_execute<'ctx>(
         semantic::resolve_execute_target(program, current_func, scoped_imports, &exec.target)
             .ok_or_else(|| format!("未找到模块或方法: {}", exec.target))?;
 
-    if resolved == STD_OUTPUT_FUNCTION {
-        return compile_std_output(exec, builder, module);
-    }
-
     let function = program
         .functions
         .iter()
@@ -272,40 +280,11 @@ fn compile_execute<'ctx>(
     let args: Vec<BasicMetadataValueEnum> = exec
         .args
         .iter()
-        .map(|arg| compile_expr(arg, context).map(Into::into))
+        .map(|arg| compile_expr(arg, builder, context).map(Into::into))
         .collect::<Result<_, _>>()?;
 
     builder
         .build_call(function, &args, "call")
-        .map_err(|e| format!("build_call failed: {:?}", e))?;
-
-    Ok(())
-}
-
-fn compile_std_output<'ctx>(
-    exec: &ExecuteStmt,
-    builder: &Builder<'ctx>,
-    module: &Module<'ctx>,
-) -> Result<(), String> {
-    if exec.args.len() != 1 {
-        return Err("标准库-输入输出-输出 expects exactly one argument".to_string());
-    }
-
-    let text = match &exec.args[0] {
-        Expr::StringLiteral(text) => text,
-        _ => return Err("标准库-输入输出-输出 currently expects a string literal".to_string()),
-    };
-
-    let puts = module
-        .get_function("puts")
-        .ok_or_else(|| "Missing standard library function: puts".to_string())?;
-    let global = builder
-        .build_global_string_ptr(text, "as.str")
-        .map_err(|e| format!("build_global_string_ptr failed: {:?}", e))?;
-    let arg = global.as_pointer_value().into();
-
-    builder
-        .build_call(puts, &[arg], "puts_call")
         .map_err(|e| format!("build_call failed: {:?}", e))?;
 
     Ok(())
