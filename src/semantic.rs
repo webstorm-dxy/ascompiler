@@ -220,6 +220,49 @@ fn validate_stmt(
                     )?;
                 }
             }
+            crate::parser::LoopStmt::Iterate {
+                var_name,
+                start,
+                end,
+                body,
+            } => {
+                let start_type = validate_expr(start, program, func, scoped_imports, locals)?;
+                if start_type != Type::Int {
+                    return Err(format!(
+                        "迭代循环起始值类型不匹配\n  = 期望: 整数\n  = 实际: {}",
+                        type_name(&start_type)
+                    ));
+                }
+                let end_type = validate_expr(end, program, func, scoped_imports, locals)?;
+                if end_type != Type::Int {
+                    return Err(format!(
+                        "迭代循环结束值类型不匹配\n  = 期望: 整数\n  = 实际: {}",
+                        type_name(&end_type)
+                    ));
+                }
+
+                let mut loop_locals = locals.clone();
+                loop_locals.insert(
+                    var_name.clone(),
+                    LocalInfo {
+                        ty: Type::Int,
+                        is_mutable: false,
+                        declaration_span: None,
+                    },
+                );
+                let mut loop_imports = scoped_imports.clone();
+                for stmt in body {
+                    validate_stmt(
+                        stmt,
+                        program,
+                        func,
+                        registry,
+                        &mut loop_imports,
+                        &mut loop_locals,
+                        source_context,
+                    )?;
+                }
+            }
             crate::parser::LoopStmt::Condition { condition, body } => {
                 validate_condition(condition, program, func, scoped_imports, locals)?;
                 let mut loop_locals = locals.clone();
@@ -767,6 +810,17 @@ mod tests {
     #[test]
     fn test_assignment_and_return_in_count_loop() {
         let source = "定义 方法 从零求和（结束值：整数）返回 整数：设 cnt = 0 循环计数i<结束值：cnt=cnt+1。。返回 cnt。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_assignment_and_return_in_iterate_loop() {
+        let source =
+            "定义 方法 求和（）返回 整数：设 cnt = 0 循环迭代i<1..5：cnt=cnt+i。。返回 cnt。。";
         let program = Parser::new(Lexer::new(source))
             .parse_program()
             .expect("Parse failed");

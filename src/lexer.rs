@@ -24,6 +24,7 @@ pub enum Token {
     Loop,      // 循环
     Count,     // 计数
     Condition, // 条件
+    Iterate,   // 迭代
 
     // Types
     VoidKw,    // 无
@@ -204,6 +205,7 @@ impl Lexer {
                     ['循', '环'] => Some(Token::Loop),
                     ['计', '数'] => Some(Token::Count),
                     ['条', '件'] => Some(Token::Condition),
+                    ['迭', '代'] => Some(Token::Iterate),
                     ['引', '用'] => Some(Token::Import),
                     ['执', '行'] => Some(Token::Execute),
                     ['整', '数'] => Some(Token::IntKw),
@@ -293,6 +295,7 @@ impl Lexer {
                         | ['循', '环']
                         | ['计', '数']
                         | ['条', '件']
+                        | ['迭', '代']
                         | ['引', '用']
                         | ['执', '行']
                         | ['整', '数']
@@ -730,7 +733,7 @@ mod tests {
 
     #[test]
     fn test_loop_keywords_without_spaces() {
-        let source = "循环计数i<10：循环条件i<5：。。。。";
+        let source = "循环计数i<10：循环迭代j<1..5：循环条件i<5：。。。。。。";
         let mut lexer = Lexer::new(source);
 
         assert_eq!(lexer.next_token(), Token::Loop);
@@ -740,11 +743,20 @@ mod tests {
         assert_eq!(lexer.next_token(), Token::IntLiteral(10));
         assert_eq!(lexer.next_token(), Token::Colon);
         assert_eq!(lexer.next_token(), Token::Loop);
+        assert_eq!(lexer.next_token(), Token::Iterate);
+        assert_eq!(lexer.next_token(), Token::Ident("j".to_string()));
+        assert_eq!(lexer.next_token(), Token::Less);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(1));
+        assert_eq!(lexer.next_token(), Token::ScopeEnd);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(5));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::Loop);
         assert_eq!(lexer.next_token(), Token::Condition);
         assert_eq!(lexer.next_token(), Token::Ident("i".to_string()));
         assert_eq!(lexer.next_token(), Token::Less);
         assert_eq!(lexer.next_token(), Token::IntLiteral(5));
         assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::ScopeEnd);
         assert_eq!(lexer.next_token(), Token::ScopeEnd);
         assert_eq!(lexer.next_token(), Token::ScopeEnd);
     }

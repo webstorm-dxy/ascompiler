@@ -110,6 +110,12 @@ pub enum LoopStmt {
         end: Expr,
         body: Vec<Stmt>,
     },
+    Iterate {
+        var_name: String,
+        start: Expr,
+        end: Expr,
+        body: Vec<Stmt>,
+    },
     Condition {
         condition: Expr,
         body: Vec<Stmt>,
@@ -591,7 +597,7 @@ impl Parser {
         })
     }
 
-    /// Parse `循环计数i<end：...。。` or `循环条件 condition：...。。`.
+    /// Parse `循环计数i<end：...。。`, `循环迭代i<start..end：...。。`, or `循环条件 condition：...。。`.
     fn parse_loop_stmt(&mut self) -> Result<LoopStmt, String> {
         self.expect(&Token::Loop)?;
         match &self.current {
@@ -608,6 +614,22 @@ impl Parser {
                     body,
                 })
             }
+            Token::Iterate => {
+                self.advance();
+                let var_name = self.expect_ident()?;
+                self.expect(&Token::Less)?;
+                let start = self.parse_expr()?;
+                self.expect(&Token::ScopeEnd)?;
+                let end = self.parse_expr()?;
+                self.expect(&Token::Colon)?;
+                let body = self.parse_statements_until_scope_end()?;
+                Ok(LoopStmt::Iterate {
+                    var_name,
+                    start,
+                    end,
+                    body,
+                })
+            }
             Token::Condition => {
                 self.advance();
                 let condition = self.parse_expr()?;
@@ -618,10 +640,10 @@ impl Parser {
             Token::Error(message) => Err(self.lexical_error(message)),
             other => Err(self.error(
                 format!(
-                    "`循环` 后期望 `计数` 或 `条件`，但找到了 `{}`",
+                    "`循环` 后期望 `计数`、`迭代` 或 `条件`，但找到了 `{}`",
                     token_name(other)
                 ),
-                "计数循环形如 `循环计数i<10：...。。`；条件循环形如 `循环条件 x<10：...。。`。",
+                "计数循环形如 `循环计数i<10：...。。`；迭代循环形如 `循环迭代i<1..5：...。。`；条件循环形如 `循环条件 x<10：...。。`。",
             )),
         }
     }
@@ -948,6 +970,7 @@ fn token_name(token: &Token) -> String {
         Token::Loop => "循环".to_string(),
         Token::Count => "计数".to_string(),
         Token::Condition => "条件".to_string(),
+        Token::Iterate => "迭代".to_string(),
         Token::VoidKw => "无".to_string(),
         Token::IntKw => "整数".to_string(),
         Token::DoubleKw => "小数".to_string(),
@@ -1399,6 +1422,31 @@ mod tests {
                 assert_eq!(body.len(), 1);
             }
             other => panic!("Expected condition loop, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_iterate_loop_range_without_spaces() {
+        let source = "定义 方法 测试（）返回 无：循环迭代i<1..5：执行输出：f“{i}”。。。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        assert_eq!(func.body.len(), 1);
+        match &func.body[0] {
+            Stmt::Loop(LoopStmt::Iterate {
+                var_name,
+                start,
+                end,
+                body,
+            }) => {
+                assert_eq!(var_name, "i");
+                assert_eq!(start, &Expr::IntLiteral(1));
+                assert_eq!(end, &Expr::IntLiteral(5));
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("Expected iterate loop, found {:?}", other),
         }
     }
 

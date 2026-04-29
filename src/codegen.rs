@@ -557,6 +557,25 @@ fn compile_loop_stmt<'ctx>(
             context,
             module,
         ),
+        LoopStmt::Iterate {
+            var_name,
+            start,
+            end,
+            body,
+        } => compile_iterate_loop(
+            var_name,
+            start,
+            end,
+            body,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            function,
+            builder,
+            context,
+            module,
+        ),
         LoopStmt::Condition { condition, body } => compile_condition_loop(
             condition,
             body,
@@ -675,6 +694,131 @@ fn compile_count_loop<'ctx>(
             .map_err(|e| format!("build_int_add failed: {:?}", e))?;
         builder
             .build_store(counter_alloca, next_counter)
+            .map_err(|e| format!("build_store failed: {:?}", e))?;
+        builder
+            .build_unconditional_branch(condition_block)
+            .map_err(|e| format!("build_unconditional_branch failed: {:?}", e))?;
+    }
+
+    builder.position_at_end(end_block);
+    Ok(())
+}
+
+fn compile_iterate_loop<'ctx>(
+    var_name: &str,
+    start: &Expr,
+    end: &Expr,
+    body: &[Stmt],
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &mut Vec<ImportDecl>,
+    locals: &mut HashMap<String, LocalValue<'ctx>>,
+    function: &FunctionValue<'ctx>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(), String> {
+    let sanitized_name = sanitize_llvm_name(var_name);
+    let iterator_alloca = builder
+        .build_alloca(context.i32_type(), &sanitized_name)
+        .map_err(|e| format!("build_alloca failed: {:?}", e))?;
+    let start_value = compile_expr(
+        start,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?
+    .into_int_value();
+    builder
+        .build_store(iterator_alloca, start_value)
+        .map_err(|e| format!("build_store failed: {:?}", e))?;
+
+    let condition_block = context.append_basic_block(*function, "loop.iterate.cond");
+    let body_block = context.append_basic_block(*function, "loop.iterate.body");
+    let end_block = context.append_basic_block(*function, "loop.iterate.end");
+
+    builder
+        .build_unconditional_branch(condition_block)
+        .map_err(|e| format!("build_unconditional_branch failed: {:?}", e))?;
+
+    builder.position_at_end(condition_block);
+    let iterator_value = builder
+        .build_load(
+            context.i32_type(),
+            iterator_alloca,
+            &format!("load.{}", sanitized_name),
+        )
+        .map_err(|e| format!("build_load failed: {:?}", e))?
+        .into_int_value();
+    let end_value = compile_expr(
+        end,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?
+    .into_int_value();
+    let condition = builder
+        .build_int_compare(
+            IntPredicate::SLT,
+            iterator_value,
+            end_value,
+            "loop.iterate.cmp",
+        )
+        .map_err(|e| format!("build_int_compare failed: {:?}", e))?;
+    builder
+        .build_conditional_branch(condition, body_block, end_block)
+        .map_err(|e| format!("build_conditional_branch failed: {:?}", e))?;
+
+    builder.position_at_end(body_block);
+    let mut loop_imports = scoped_imports.clone();
+    let mut loop_locals = locals.clone();
+    loop_locals.insert(
+        var_name.to_string(),
+        LocalValue::Pointer(iterator_alloca, Type::Int, false),
+    );
+    for stmt in body {
+        compile_stmt(
+            stmt,
+            current_func,
+            program,
+            &mut loop_imports,
+            &mut loop_locals,
+            function,
+            builder,
+            context,
+            module,
+        )?;
+    }
+    if builder
+        .get_insert_block()
+        .and_then(|block| block.get_terminator())
+        .is_none()
+    {
+        let current_iterator = builder
+            .build_load(
+                context.i32_type(),
+                iterator_alloca,
+                &format!("load.{}", sanitized_name),
+            )
+            .map_err(|e| format!("build_load failed: {:?}", e))?
+            .into_int_value();
+        let next_iterator = builder
+            .build_int_add(
+                current_iterator,
+                context.i32_type().const_int(1, false),
+                "loop.iterate.next",
+            )
+            .map_err(|e| format!("build_int_add failed: {:?}", e))?;
+        builder
+            .build_store(iterator_alloca, next_iterator)
             .map_err(|e| format!("build_store failed: {:?}", e))?;
         builder
             .build_unconditional_branch(condition_block)
