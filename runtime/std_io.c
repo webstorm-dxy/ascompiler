@@ -30,12 +30,7 @@ int as_std_io_output(const char *text) {
     return puts(text);
 }
 
-int as_std_io_input_int(const char *prompt) {
-    if (prompt != NULL) {
-        fputs(prompt, stdout);
-        fflush(stdout);
-    }
-
+int as_std_io_input_int(void) {
     int value = 0;
     if (scanf("%d", &value) != 1) {
         return 0;

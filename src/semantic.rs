@@ -1,7 +1,7 @@
 use crate::lexer::Span;
 use crate::parser::{
-    AssignStmt, BinaryOp, Expr, FormatPart, FunctionDef, ImportDecl, Program, ReturnStmt, Stmt,
-    Type, UnaryOp, VarDecl,
+    ArrayAssignStmt, AssignStmt, BinaryOp, Expr, FormatPart, FunctionDef, ImportDecl, Program,
+    ReturnStmt, Stmt, Type, UnaryOp, VarDecl,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -133,6 +133,16 @@ fn validate_stmt(
         }
         Stmt::Assign(assign) => {
             validate_assign_stmt(
+                assign,
+                program,
+                func,
+                scoped_imports,
+                locals,
+                source_context,
+            )?;
+        }
+        Stmt::ArrayAssign(assign) => {
+            validate_array_assign_stmt(
                 assign,
                 program,
                 func,
@@ -347,7 +357,9 @@ fn validate_var_decl(
     let var_type = match (&var.var_type, &var.init) {
         (Some(var_type), Some(init)) => {
             let inferred_type = validate_expr(init, program, func, scoped_imports, locals)?;
-            if &inferred_type != var_type {
+            if let Some(resolved_type) = resolve_declared_type(var_type, &inferred_type) {
+                resolved_type
+            } else {
                 return Err(format!(
                     "变量初始化类型不匹配: `{}`\n  = 声明类型: {}\n  = 表达式类型: {}\n  = 帮助: 请让初始化表达式返回相同类型，或调整变量的声明类型。",
                     var.name,
@@ -355,9 +367,16 @@ fn validate_var_decl(
                     type_name(&inferred_type)
                 ));
             }
+        }
+        (Some(var_type), None) => {
+            if is_unsized_array(var_type) {
+                return Err(format!(
+                    "数组预定义 `{}` 缺少长度\n  = 帮助: 请写成 `定义 变量：数组 {}[10]`，或使用数组字面量初始化。",
+                    var.name, var.name
+                ));
+            }
             var_type.clone()
         }
-        (Some(var_type), None) => var_type.clone(),
         (None, Some(init)) => validate_expr(init, program, func, scoped_imports, locals)?,
         (None, None) => {
             return Err(format!(
@@ -416,6 +435,72 @@ fn validate_assign_stmt(
             "赋值类型不匹配: `{}`\n  = 变量类型: {}\n  = 表达式类型: {}\n  = 帮助: 请让右侧表达式返回相同类型，或调整变量的声明类型。",
             assign.name,
             type_name(&target.ty),
+            type_name(&value_type)
+        ))
+    }
+}
+
+fn validate_array_assign_stmt(
+    assign: &ArrayAssignStmt,
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalInfo>,
+    source_context: SourceContext<'_>,
+) -> Result<(), String> {
+    let target = locals.get(&assign.name).ok_or_else(|| {
+        format!(
+            "未定义的变量 `{}`\n  = 帮助: 请确认数组已在当前作用域中声明。",
+            assign.name
+        )
+    })?;
+    if !target.is_mutable {
+        if let (Some(source), Some(declaration_span)) =
+            (source_context.source, target.declaration_span)
+        {
+            return Err(render_immutable_assignment(
+                source_context.source_name,
+                source,
+                &assign.name,
+                declaration_span,
+                assign.span,
+            ));
+        }
+        return Err(format!("不可变数组不能修改元素: `{}`", assign.name));
+    }
+    let Type::Array {
+        element_type,
+        length,
+    } = &target.ty
+    else {
+        return Err(format!(
+            "不能对 {} 类型设置数组元素\n  = 帮助: 元素设置形如 `设arr[1]=10`，目标必须是数组。",
+            type_name(&target.ty)
+        ));
+    };
+    let index_type = validate_expr(&assign.index, program, func, scoped_imports, locals)?;
+    if index_type != Type::Int {
+        return Err(format!(
+            "数组下标类型不匹配\n  = 期望: 整数\n  = 实际: {}",
+            type_name(&index_type)
+        ));
+    }
+    if let (Some(length), Expr::IntLiteral(index_value)) = (length, &assign.index) {
+        if *index_value < 0 || *index_value as usize >= *length {
+            return Err(format!(
+                "数组下标越界\n  = 数组长度: {}\n  = 下标: {}\n  = 帮助: 数组下标从 0 开始。",
+                length, index_value
+            ));
+        }
+    }
+    let value_type = validate_expr(&assign.value, program, func, scoped_imports, locals)?;
+    if value_type == **element_type {
+        Ok(())
+    } else {
+        Err(format!(
+            "数组元素赋值类型不匹配: `{}`\n  = 元素类型: {}\n  = 表达式类型: {}",
+            assign.name,
+            type_name(element_type),
             type_name(&value_type)
         ))
     }
@@ -549,6 +634,43 @@ fn validate_expr(
             }
             Ok(Type::String)
         }
+        Expr::ArrayLiteral(elements) => {
+            validate_array_literal(elements, program, func, scoped_imports, locals)
+        }
+        Expr::Index { array, index } => {
+            if !matches!(array.as_ref(), Expr::Ident(_)) {
+                return Err("当前只支持通过变量名访问数组\n  = 帮助: 请写成 `arr[n]`。".to_string());
+            }
+            let array_type = validate_expr(array, program, func, scoped_imports, locals)?;
+            let index_type = validate_expr(index, program, func, scoped_imports, locals)?;
+            if index_type != Type::Int {
+                return Err(format!(
+                    "数组下标类型不匹配\n  = 期望: 整数\n  = 实际: {}",
+                    type_name(&index_type)
+                ));
+            }
+            match array_type {
+                Type::Array {
+                    element_type,
+                    length,
+                } => {
+                    if let (Some(length), Expr::IntLiteral(index_value)) = (length, index.as_ref())
+                    {
+                        if *index_value < 0 || *index_value as usize >= length {
+                            return Err(format!(
+                                "数组下标越界\n  = 数组长度: {}\n  = 下标: {}\n  = 帮助: 数组下标从 0 开始。",
+                                length, index_value
+                            ));
+                        }
+                    }
+                    Ok(*element_type)
+                }
+                other => Err(format!(
+                    "不能对 {} 类型使用数组访问\n  = 帮助: 数组访问形如 `arr[n]`，左侧必须是数组。",
+                    type_name(&other)
+                )),
+            }
+        }
         Expr::Unary { op, expr } => {
             let ty = validate_expr(expr, program, func, scoped_imports, locals)?;
             match (op, ty) {
@@ -615,6 +737,57 @@ fn validate_expr(
             }
         }
     }
+}
+
+fn validate_array_literal(
+    elements: &[Expr],
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalInfo>,
+) -> Result<Type, String> {
+    if elements.is_empty() {
+        return Err(
+            "数组字面量不能为空\n  = 帮助: 请至少提供一个元素，例如 `【1，2，3】`。".to_string(),
+        );
+    }
+    for element in elements {
+        let element_type = validate_expr(element, program, func, scoped_imports, locals)?;
+        if element_type != Type::Int {
+            return Err(format!(
+                "数组元素类型不匹配\n  = 期望: 整数\n  = 实际: {}\n  = 帮助: 当前数组先支持整数元素。",
+                type_name(&element_type)
+            ));
+        }
+    }
+    Ok(Type::Array {
+        element_type: Box::new(Type::Int),
+        length: Some(elements.len()),
+    })
+}
+
+fn resolve_declared_type(declared: &Type, inferred: &Type) -> Option<Type> {
+    match (declared, inferred) {
+        (
+            Type::Array {
+                element_type: declared_element,
+                length: None,
+            },
+            Type::Array {
+                element_type: inferred_element,
+                length: Some(length),
+            },
+        ) if declared_element == inferred_element => Some(Type::Array {
+            element_type: declared_element.clone(),
+            length: Some(*length),
+        }),
+        _ if declared == inferred => Some(declared.clone()),
+        _ => None,
+    }
+}
+
+fn is_unsized_array(ty: &Type) -> bool {
+    matches!(ty, Type::Array { length: None, .. })
 }
 
 fn validate_import(import: &ImportDecl, registry: &ModuleRegistry) -> Result<(), String> {
@@ -763,15 +936,22 @@ fn line_col(source: &str, pos: usize) -> (usize, usize, usize) {
     (line, col, line_start)
 }
 
-fn type_name(ty: &Type) -> &'static str {
+fn type_name(ty: &Type) -> String {
     match ty {
-        Type::Void => "无",
-        Type::Int => "整数",
-        Type::Double => "小数",
-        Type::Float => "浮点",
-        Type::Bool => "布尔",
-        Type::Char => "字符",
-        Type::String => "字符串",
+        Type::Void => "无".to_string(),
+        Type::Int => "整数".to_string(),
+        Type::Double => "小数".to_string(),
+        Type::Float => "浮点".to_string(),
+        Type::Bool => "布尔".to_string(),
+        Type::Char => "字符".to_string(),
+        Type::String => "字符串".to_string(),
+        Type::Array {
+            element_type,
+            length,
+        } => match length {
+            Some(length) => format!("{}数组[{}]", type_name(element_type), length),
+            None => format!("{}数组", type_name(element_type)),
+        },
     }
 }
 
@@ -979,6 +1159,69 @@ mod tests {
     }
 
     #[test]
+    fn test_array_literal_and_predefined_array_are_valid() {
+        let source = "定义 方法 测试（）返回 无：定义可变变量：数组 arr = 【1，2，3，4】 定义变量：数组 empty[10]。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_predefined_array_requires_length() {
+        let source = "定义 方法 测试（）返回 无：定义变量：数组 arr。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        let err = analyze(&program).expect_err("Expected missing array length error");
+        assert!(err.contains("数组预定义 `arr` 缺少长度"));
+    }
+
+    #[test]
+    fn test_array_index_returns_element_type() {
+        let source = "定义 方法 测试（）返回 整数：定义变量：数组 arr = [1,2,3] 返回 arr[1]。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_array_index_must_be_in_bounds_when_literal() {
+        let source = "定义 方法 测试（）返回 整数：定义变量：数组 arr = [1,2,3] 返回 arr[3]。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        let err = analyze(&program).expect_err("Expected array index error");
+        assert!(err.contains("数组下标越界"));
+    }
+
+    #[test]
+    fn test_array_element_assignment_is_valid() {
+        let source = "定义 方法 测试（）返回 整数：设 arr = [1,2,3] 设arr【1】=10 设arr[2]为20 返回 arr[1]+arr[2]。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_immutable_array_element_assignment_is_rejected() {
+        let source = "定义 方法 测试（）返回 无：定义变量：数组 arr = [1,2,3] 设arr[1]=10。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        let err = analyze(&program).expect_err("Expected immutable array assignment error");
+        assert!(err.contains("不可变"));
+    }
+
+    #[test]
     fn test_function_call_expression_uses_return_type() {
         let source = "定义 方法 从零求和（结束值：整数）返回 整数：返回 结束值。。定义 方法 测试（）返回 无：设 s = 从零求和（10）。。";
         let program = Parser::new(Lexer::new(source))
@@ -990,7 +1233,7 @@ mod tests {
 
     #[test]
     fn test_take_value_input_int_uses_std_return_type() {
-        let source = "引用 模块：标准库-输入输出-获取输入 为 获取输入\n定义 方法 测试（）返回 无：设 s = 取值 获取输入->整数：“输入提示词”。。";
+        let source = "引用 模块：标准库-输入输出-获取输入 为 获取输入\n定义 方法 测试（）返回 无：设 s = 取值 获取输入->整数。。";
         let program = Parser::new(Lexer::new(source))
             .parse_program()
             .expect("Parse failed");

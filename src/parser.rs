@@ -49,6 +49,7 @@ pub struct FunctionDef {
 pub enum Stmt {
     VarDecl(VarDecl),
     Assign(AssignStmt),
+    ArrayAssign(ArrayAssignStmt),
     Return(ReturnStmt),
     Import(ImportDecl),
     Execute(ExecuteStmt),
@@ -61,6 +62,15 @@ pub enum Stmt {
 pub struct AssignStmt {
     pub name: String,
     pub name_span: Span,
+    pub span: Span,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrayAssignStmt {
+    pub name: String,
+    pub name_span: Span,
+    pub index: Expr,
     pub span: Span,
     pub value: Expr,
 }
@@ -141,7 +151,12 @@ pub enum Expr {
     IntLiteral(i64),
     StringLiteral(String),
     FormattedString(Vec<FormatPart>),
+    ArrayLiteral(Vec<Expr>),
     Ident(String),
+    Index {
+        array: Box<Expr>,
+        index: Box<Expr>,
+    },
     Call {
         target: String,
         type_arg: Option<Type>,
@@ -202,6 +217,10 @@ pub enum Type {
     Bool,
     Char,
     String,
+    Array {
+        element_type: Box<Type>,
+        length: Option<usize>,
+    },
 }
 
 impl Type {
@@ -596,7 +615,7 @@ impl Parser {
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
         match &self.current {
             Token::Define => self.parse_var_decl().map(Stmt::VarDecl),
-            Token::Let => self.parse_let_stmt().map(Stmt::VarDecl),
+            Token::Let => self.parse_let_stmt(),
             Token::ReturnKw => self.parse_return_stmt().map(Stmt::Return),
             Token::Ident(_) => self.parse_assign_stmt().map(Stmt::Assign),
             Token::Import => self.parse_import_decl().map(Stmt::Import),
@@ -747,12 +766,20 @@ impl Parser {
         self.expect(&Token::Colon)?;
 
         // Try to parse an explicit type
-        let var_type = Type::from_token(&self.current);
-        if var_type.is_some() {
-            self.advance();
-        }
+        let mut var_type = self.parse_optional_var_type();
 
         let (name, name_span) = self.expect_ident_span()?;
+        if matches!(var_type, Some(Type::Array { length: None, .. }))
+            && self.current == Token::LBracket
+        {
+            self.advance();
+            let length = self.expect_array_length()?;
+            self.expect(&Token::RBracket)?;
+            var_type = Some(Type::Array {
+                element_type: Box::new(Type::Int),
+                length: Some(length),
+            });
+        }
         let init = if self.is_assignment_operator() {
             self.expect_assignment_operator()?;
             Some(self.parse_expr()?)
@@ -775,12 +802,64 @@ impl Parser {
         })
     }
 
+    fn parse_optional_var_type(&mut self) -> Option<Type> {
+        if self.current == Token::ArrayKw {
+            self.advance();
+            return Some(Type::Array {
+                element_type: Box::new(Type::Int),
+                length: None,
+            });
+        }
+        let var_type = Type::from_token(&self.current);
+        if var_type.is_some() {
+            self.advance();
+        }
+        var_type
+    }
+
+    fn expect_array_length(&mut self) -> Result<usize, String> {
+        match &self.current {
+            Token::IntLiteral(value) if *value > 0 => {
+                let length = *value as usize;
+                self.advance();
+                Ok(length)
+            }
+            Token::IntLiteral(_) => Err(self.error(
+                "数组长度必须大于 0",
+                "数组预定义形如 `定义 变量：数组 arr[10]`，方括号里需要正整数长度。",
+            )),
+            Token::Error(message) => Err(self.lexical_error(message)),
+            other => Err(self.error(
+                format!("期望数组长度，但找到了 `{}`", token_name(other)),
+                "数组预定义形如 `定义 变量：数组 arr[10]`，方括号里需要正整数长度。",
+            )),
+        }
+    }
+
     /// Parse a simplified variable declaration: `设 name (=|为) expr`.
     /// `设` variables are mutable by default.
-    fn parse_let_stmt(&mut self) -> Result<VarDecl, String> {
+    fn parse_let_stmt(&mut self) -> Result<Stmt, String> {
         let start = self.current_span.start;
         self.expect(&Token::Let)?;
         let (name, name_span) = self.expect_ident_span()?;
+        if self.current == Token::LBracket {
+            self.advance();
+            let index = self.parse_expr()?;
+            self.expect(&Token::RBracket)?;
+            self.expect_assignment_operator()?;
+            let value = self.parse_expr()?;
+            let span = Span {
+                start,
+                end: self.current_span.start.max(name_span.end),
+            };
+            return Ok(Stmt::ArrayAssign(ArrayAssignStmt {
+                name,
+                name_span,
+                index,
+                span,
+                value,
+            }));
+        }
         self.expect_assignment_operator()?;
         let init = self.parse_expr()?;
         let span = Span {
@@ -788,14 +867,14 @@ impl Parser {
             end: self.current_span.start.max(name_span.end),
         };
 
-        Ok(VarDecl {
+        Ok(Stmt::VarDecl(VarDecl {
             name,
             name_span,
             span,
             var_type: None,
             is_mutable: true,
             init: Some(init),
-        })
+        }))
     }
 
     /// Parse an assignment statement: `name (=|为) expr`
@@ -986,8 +1065,22 @@ impl Parser {
                     expr: Box::new(self.parse_unary()?),
                 })
             }
-            _ => self.parse_primary(),
+            _ => self.parse_postfix(),
         }
+    }
+
+    fn parse_postfix(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_primary()?;
+        while self.current == Token::LBracket {
+            self.advance();
+            let index = self.parse_expr()?;
+            self.expect(&Token::RBracket)?;
+            expr = Expr::Index {
+                array: Box::new(expr),
+                index: Box::new(index),
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
@@ -1012,6 +1105,7 @@ impl Parser {
                 self.advance();
                 Ok(Expr::FormattedString(parts))
             }
+            Token::LBracket => self.parse_array_literal(),
             Token::Ident(name) => {
                 let name = name.clone();
                 self.advance();
@@ -1048,9 +1142,26 @@ impl Parser {
             Token::Error(message) => Err(self.lexical_error(message)),
             other => Err(self.error(
                 format!("期望表达式，但找到了 `{}`", token_name(other)),
-                "表达式可以是整数、字符串、变量名、方法调用、括号表达式或一元/二元运算。",
+                "表达式可以是整数、字符串、数组字面量、变量名、方法调用、括号表达式或一元/二元运算。",
             )),
         }
+    }
+
+    fn parse_array_literal(&mut self) -> Result<Expr, String> {
+        self.expect(&Token::LBracket)?;
+        let mut elements = Vec::new();
+        if self.current != Token::RBracket {
+            loop {
+                elements.push(self.parse_expr()?);
+                if self.current == Token::Comma {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Token::RBracket)?;
+        Ok(Expr::ArrayLiteral(elements))
     }
 
     fn parse_take_value_expr(&mut self) -> Result<Expr, String> {
@@ -1058,6 +1169,15 @@ impl Parser {
         let target = self.expect_ident()?;
         self.expect(&Token::Arrow)?;
         let type_arg = self.parse_type()?;
+
+        if self.current != Token::Colon {
+            return Ok(Expr::Call {
+                target,
+                type_arg: Some(type_arg),
+                args: Vec::new(),
+            });
+        }
+
         self.expect(&Token::Colon)?;
 
         let mut args = Vec::new();
@@ -1122,6 +1242,7 @@ fn token_name(token: &Token) -> String {
         Token::BoolKw => "布尔".to_string(),
         Token::CharKw => "字符".to_string(),
         Token::StringKw => "字符串".to_string(),
+        Token::ArrayKw => "数组".to_string(),
         Token::IntTypeKw => "整型".to_string(),
         Token::Variable => "变量".to_string(),
         Token::Mutable => "可变".to_string(),
@@ -1132,6 +1253,8 @@ fn token_name(token: &Token) -> String {
         Token::Execute => "执行".to_string(),
         Token::LParen => "(".to_string(),
         Token::RParen => ")".to_string(),
+        Token::LBracket => "[".to_string(),
+        Token::RBracket => "]".to_string(),
         Token::Colon => ":".to_string(),
         Token::ScopeEnd => "。。".to_string(),
         Token::Comma => ",".to_string(),
@@ -1458,6 +1581,112 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_array_literal_with_chinese_brackets() {
+        let source = "定义 方法 测试（）返回 无：定义可变变量：数组 arr = 【1，2，3，4】。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[0] {
+            Stmt::VarDecl(v) => {
+                assert_eq!(v.name, "arr");
+                assert!(v.is_mutable);
+                assert_eq!(
+                    v.var_type,
+                    Some(Type::Array {
+                        element_type: Box::new(Type::Int),
+                        length: None,
+                    })
+                );
+                assert_eq!(
+                    v.init,
+                    Some(Expr::ArrayLiteral(vec![
+                        Expr::IntLiteral(1),
+                        Expr::IntLiteral(2),
+                        Expr::IntLiteral(3),
+                        Expr::IntLiteral(4),
+                    ]))
+                );
+            }
+            other => panic!("Expected VarDecl, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_predefined_array_with_english_brackets() {
+        let source = "定义 方法 测试（）返回 无：定义变量：数组 arr[10]。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[0] {
+            Stmt::VarDecl(v) => {
+                assert_eq!(v.name, "arr");
+                assert!(v.is_mutable);
+                assert_eq!(
+                    v.var_type,
+                    Some(Type::Array {
+                        element_type: Box::new(Type::Int),
+                        length: Some(10),
+                    })
+                );
+                assert_eq!(v.init, None);
+            }
+            other => panic!("Expected VarDecl, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_index_expression() {
+        let source = "定义 方法 测试（）返回 整数：定义变量：数组 arr = [1,2,3] 返回 arr[1]。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[1] {
+            Stmt::Return(ReturnStmt { value: Some(expr) }) => {
+                assert_eq!(
+                    expr,
+                    &Expr::Index {
+                        array: Box::new(Expr::Ident("arr".to_string())),
+                        index: Box::new(Expr::IntLiteral(1)),
+                    }
+                );
+            }
+            other => panic!("Expected return with index expression, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_element_assignment_with_let_prefix() {
+        let source = "定义 方法 测试（）返回 无：设 arr = [1,2,3] 设arr【1】=10 设arr[2]为20。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[1] {
+            Stmt::ArrayAssign(assign) => {
+                assert_eq!(assign.name, "arr");
+                assert_eq!(assign.index, Expr::IntLiteral(1));
+                assert_eq!(assign.value, Expr::IntLiteral(10));
+            }
+            other => panic!("Expected ArrayAssign, found {:?}", other),
+        }
+        match &func.body[2] {
+            Stmt::ArrayAssign(assign) => {
+                assert_eq!(assign.name, "arr");
+                assert_eq!(assign.index, Expr::IntLiteral(2));
+                assert_eq!(assign.value, Expr::IntLiteral(20));
+            }
+            other => panic!("Expected ArrayAssign, found {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_parse_chinese_variable_name() {
         let source = "定义 方法 测试（）返回 无：设 结果=100。。";
         let lexer = Lexer::new(source);
@@ -1717,6 +1946,30 @@ mod tests {
                         target: "获取输入".to_string(),
                         type_arg: Some(Type::Int),
                         args: vec![Expr::StringLiteral("输入提示词".to_string())],
+                    })
+                );
+            }
+            other => panic!("Expected VarDecl, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_take_value_generic_call_without_args() {
+        let source = "定义 方法 测试（）返回 无：设 s = 取值 获取输入->整数。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[0] {
+            Stmt::VarDecl(var) => {
+                assert_eq!(var.name, "s");
+                assert_eq!(
+                    var.init,
+                    Some(Expr::Call {
+                        target: "获取输入".to_string(),
+                        type_arg: Some(Type::Int),
+                        args: vec![],
                     })
                 );
             }

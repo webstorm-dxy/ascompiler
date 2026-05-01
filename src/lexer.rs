@@ -38,6 +38,7 @@ pub enum Token {
     BoolKw,    // 布尔
     CharKw,    // 字符
     StringKw,  // 字符串
+    ArrayKw,   // 数组
     IntTypeKw, // 整型 (integer type, used in variable declarations)
 
     // Variable definition
@@ -54,6 +55,8 @@ pub enum Token {
     // Symbols (bilingual: Chinese and English)
     LParen,    // ( or （
     RParen,    // ) or ）
+    LBracket,  // [ or 【
+    RBracket,  // ] or 】
     Colon,     // : or ：
     ScopeEnd,  // .. or 。。
     Comma,     // , or ，
@@ -221,6 +224,7 @@ impl Lexer {
                     ['浮', '点'] => Some(Token::FloatKw),
                     ['布', '尔'] => Some(Token::BoolKw),
                     ['字', '符'] => Some(Token::CharKw),
+                    ['数', '组'] => Some(Token::ArrayKw),
                     ['变', '量'] => Some(Token::Variable),
                     ['可', '变'] => Some(Token::Mutable),
                     ['整', '型'] => Some(Token::IntTypeKw),
@@ -318,6 +322,7 @@ impl Lexer {
                         | ['浮', '点']
                         | ['布', '尔']
                         | ['字', '符']
+                        | ['数', '组']
                         | ['变', '量']
                         | ['可', '变']
                         | ['整', '型']
@@ -396,6 +401,10 @@ impl Lexer {
                     | ')'
                     | '（'
                     | '）'
+                    | '['
+                    | ']'
+                    | '【'
+                    | '】'
                     | ':'
                     | '：'
                     | ','
@@ -488,6 +497,14 @@ impl Lexer {
             ')' | '）' => {
                 self.advance();
                 Token::RParen
+            }
+            '[' | '【' => {
+                self.advance();
+                Token::LBracket
+            }
+            ']' | '】' => {
+                self.advance();
+                Token::RBracket
             }
             ':' | '：' => {
                 self.advance();
@@ -673,6 +690,29 @@ mod tests {
         assert_eq!(lexer.next_token(), Token::Colon);
         assert_eq!(lexer.next_token(), Token::IntKw);
         assert_eq!(lexer.next_token(), Token::RParen); // ）
+    }
+
+    #[test]
+    fn test_array_keyword_and_brackets() {
+        let source = "定义变量：数组 arr【10】 设 b=[1,2]";
+        let mut lexer = Lexer::new(source);
+
+        assert_eq!(lexer.next_token(), Token::Define);
+        assert_eq!(lexer.next_token(), Token::Variable);
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::ArrayKw);
+        assert_eq!(lexer.next_token(), Token::Ident("arr".to_string()));
+        assert_eq!(lexer.next_token(), Token::LBracket);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(10));
+        assert_eq!(lexer.next_token(), Token::RBracket);
+        assert_eq!(lexer.next_token(), Token::Let);
+        assert_eq!(lexer.next_token(), Token::Ident("b".to_string()));
+        assert_eq!(lexer.next_token(), Token::Equals);
+        assert_eq!(lexer.next_token(), Token::LBracket);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(1));
+        assert_eq!(lexer.next_token(), Token::Comma);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(2));
+        assert_eq!(lexer.next_token(), Token::RBracket);
     }
 
     #[test]

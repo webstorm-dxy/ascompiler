@@ -1,7 +1,7 @@
 /// Code generation: walks the AST and emits LLVM IR via inkwell.
 use crate::parser::{
-    AssignStmt, BinaryOp, ExecuteStmt, Expr, FormatPart, FunctionDef, IfStmt, ImportDecl, LoopStmt,
-    Program, ReturnStmt, SelectStmt, Stmt, Type, UnaryOp, VarDecl,
+    ArrayAssignStmt, AssignStmt, BinaryOp, ExecuteStmt, Expr, FormatPart, FunctionDef, IfStmt,
+    ImportDecl, LoopStmt, Program, ReturnStmt, SelectStmt, Stmt, Type, UnaryOp, VarDecl,
 };
 use crate::semantic;
 use crate::stdlib;
@@ -48,6 +48,12 @@ fn as_llvm_type<'ctx>(ty: &Type, context: &'ctx Context) -> BasicTypeEnum<'ctx> 
         Type::Bool => context.bool_type().into(),
         Type::Char => context.i8_type().into(),
         Type::String => context.ptr_type(AddressSpace::from(0u16)).into(),
+        Type::Array {
+            element_type,
+            length,
+        } => as_llvm_type(element_type, context)
+            .array_type(length.expect("array type must have a known length") as u32)
+            .into(),
     }
 }
 
@@ -215,6 +221,10 @@ fn compile_function<'ctx>(
                         &context.ptr_type(AddressSpace::from(0u16)).const_null(),
                     ));
                 }
+                Type::Array { .. } => {
+                    let _ = builder
+                        .build_return(Some(&as_llvm_type(&func.return_type, context).const_zero()));
+                }
                 Type::Void => unreachable!(),
             }
         }
@@ -247,6 +257,16 @@ fn compile_stmt<'ctx>(
             module,
         ),
         Stmt::Assign(assign) => compile_assign_stmt(
+            assign,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
+        Stmt::ArrayAssign(assign) => compile_array_assign_stmt(
             assign,
             current_func,
             program,
@@ -328,16 +348,7 @@ fn compile_var_decl<'ctx>(
     module: &Module<'ctx>,
 ) -> Result<(), String> {
     // Determine the LLVM type
-    let var_type = match &var.var_type {
-        Some(t) => t.clone(),
-        None => {
-            let init = var
-                .init
-                .as_ref()
-                .ok_or_else(|| format!("预定义变量缺少类型: {}", var.name))?;
-            infer_type_from_expr(init, current_func, program, scoped_imports, locals)?
-        }
-    };
+    let var_type = resolve_var_type(var, current_func, program, scoped_imports, locals)?;
     let llvm_type = as_llvm_type(&var_type, context);
 
     // Alloca
@@ -402,6 +413,49 @@ fn compile_assign_stmt<'ctx>(
         .build_store(ptr, value)
         .map(|_| ())
         .map_err(|e| format!("build_store failed: {:?}", e))
+}
+
+fn compile_array_assign_stmt<'ctx>(
+    assign: &ArrayAssignStmt,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(), String> {
+    let (element_ptr, element_type) = compile_array_element_ptr(
+        &assign.name,
+        &assign.index,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
+    let value = compile_expr(
+        &assign.value,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
+    builder
+        .build_store(element_ptr, value)
+        .map(|_| ())
+        .map_err(|e| {
+            format!(
+                "build_store array element failed for {}: {:?}",
+                type_name(&element_type),
+                e
+            )
+        })
 }
 
 fn compile_return_stmt<'ctx>(
@@ -1133,6 +1187,27 @@ fn compile_expr<'ctx>(
         Expr::FormattedString(parts) => {
             compile_formatted_string(parts, locals, builder, context, module)
         }
+        Expr::ArrayLiteral(elements) => compile_array_literal(
+            elements,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
+        Expr::Index { array, index } => compile_array_index(
+            array,
+            index,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
         Expr::Unary { op, expr } => {
             let value = compile_expr(
                 expr,
@@ -1456,6 +1531,41 @@ fn infer_type_from_expr<'ctx>(
             }
             Ok(Type::String)
         }
+        Expr::ArrayLiteral(elements) => {
+            if elements.is_empty() {
+                return Err("数组字面量不能为空".to_string());
+            }
+            for element in elements {
+                let element_type =
+                    infer_type_from_expr(element, current_func, program, scoped_imports, locals)?;
+                if element_type != Type::Int {
+                    return Err(format!(
+                        "数组元素暂只支持整数，实际为 {}",
+                        type_name(&element_type)
+                    ));
+                }
+            }
+            Ok(Type::Array {
+                element_type: Box::new(Type::Int),
+                length: Some(elements.len()),
+            })
+        }
+        Expr::Index { array, index } => {
+            let array_type =
+                infer_type_from_expr(array, current_func, program, scoped_imports, locals)?;
+            let index_type =
+                infer_type_from_expr(index, current_func, program, scoped_imports, locals)?;
+            if index_type != Type::Int {
+                return Err(format!(
+                    "数组下标必须是整数，实际为 {}",
+                    type_name(&index_type)
+                ));
+            }
+            match array_type {
+                Type::Array { element_type, .. } => Ok(*element_type),
+                other => Err(format!("不能对 {} 类型使用数组访问", type_name(&other))),
+            }
+        }
         Expr::Unary { op, expr } => match op {
             UnaryOp::Neg => {
                 infer_type_from_expr(expr, current_func, program, scoped_imports, locals)
@@ -1476,6 +1586,187 @@ fn infer_type_from_expr<'ctx>(
             | BinaryOp::Or => Ok(Type::Bool),
         },
     }
+}
+
+fn resolve_var_type<'ctx>(
+    var: &VarDecl,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+) -> Result<Type, String> {
+    match (&var.var_type, &var.init) {
+        (Some(declared), Some(init)) => {
+            let inferred =
+                infer_type_from_expr(init, current_func, program, scoped_imports, locals)?;
+            resolve_declared_type(declared, &inferred).ok_or_else(|| {
+                format!(
+                    "变量初始化类型不匹配: `{}`\n  = 声明类型: {}\n  = 表达式类型: {}",
+                    var.name,
+                    type_name(declared),
+                    type_name(&inferred)
+                )
+            })
+        }
+        (Some(declared), None) => {
+            if is_unsized_array(declared) {
+                Err(format!("数组预定义缺少长度: {}", var.name))
+            } else {
+                Ok(declared.clone())
+            }
+        }
+        (None, Some(init)) => {
+            infer_type_from_expr(init, current_func, program, scoped_imports, locals)
+        }
+        (None, None) => Err(format!("预定义变量缺少类型: {}", var.name)),
+    }
+}
+
+fn resolve_declared_type(declared: &Type, inferred: &Type) -> Option<Type> {
+    match (declared, inferred) {
+        (
+            Type::Array {
+                element_type: declared_element,
+                length: None,
+            },
+            Type::Array {
+                element_type: inferred_element,
+                length: Some(length),
+            },
+        ) if declared_element == inferred_element => Some(Type::Array {
+            element_type: declared_element.clone(),
+            length: Some(*length),
+        }),
+        _ if declared == inferred => Some(declared.clone()),
+        _ => None,
+    }
+}
+
+fn is_unsized_array(ty: &Type) -> bool {
+    matches!(ty, Type::Array { length: None, .. })
+}
+
+fn compile_array_literal<'ctx>(
+    elements: &[Expr],
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, String> {
+    if elements.is_empty() {
+        return Err("数组字面量不能为空".to_string());
+    }
+    let array_type = context.i32_type().array_type(elements.len() as u32);
+    let mut array_value = array_type.const_zero();
+    for (index, element) in elements.iter().enumerate() {
+        let value = compile_expr(
+            element,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        )?;
+        array_value = builder
+            .build_insert_value(array_value, value, index as u32, "array.insert")
+            .map_err(|e| format!("build_insert_value failed: {:?}", e))?
+            .into_array_value();
+    }
+    Ok(array_value.into())
+}
+
+fn compile_array_index<'ctx>(
+    array: &Expr,
+    index: &Expr,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, String> {
+    let Expr::Ident(name) = array else {
+        return Err("当前只支持通过变量名访问数组，例如 `arr[n]`。".to_string());
+    };
+    let (element_ptr, element_type) = compile_array_element_ptr(
+        name,
+        index,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
+    builder
+        .build_load(
+            as_llvm_type(&element_type, context),
+            element_ptr,
+            "array.elem",
+        )
+        .map_err(|e| format!("build_load failed: {:?}", e))
+}
+
+fn compile_array_element_ptr<'ctx>(
+    name: &str,
+    index: &Expr,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(PointerValue<'ctx>, Type), String> {
+    let local = locals
+        .get(name)
+        .ok_or_else(|| format!("未定义的变量: {}", name))?;
+    let LocalValue::Pointer(array_ptr, array_type, _) = local.clone();
+    let Type::Array {
+        element_type,
+        length,
+    } = array_type
+    else {
+        return Err(format!("不能对非数组变量使用下标访问: {}", name));
+    };
+    let length = length.ok_or_else(|| format!("数组缺少长度: {}", name))?;
+    let llvm_array_type = as_llvm_type(
+        &Type::Array {
+            element_type: element_type.clone(),
+            length: Some(length),
+        },
+        context,
+    );
+    let index_value = compile_expr(
+        index,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?
+    .into_int_value();
+    let zero = context.i32_type().const_zero();
+    let element_ptr = unsafe {
+        builder
+            .build_in_bounds_gep(
+                llvm_array_type,
+                array_ptr,
+                &[zero, index_value],
+                "array.elem.ptr",
+            )
+            .map_err(|e| format!("build_in_bounds_gep failed: {:?}", e))?
+    };
+    Ok((element_ptr, *element_type))
 }
 
 fn compile_formatted_string<'ctx>(
@@ -1534,15 +1825,22 @@ fn local_type<'ctx>(local: &LocalValue<'ctx>) -> Type {
     }
 }
 
-fn type_name(ty: &Type) -> &'static str {
+fn type_name(ty: &Type) -> String {
     match ty {
-        Type::Void => "无",
-        Type::Int => "整数",
-        Type::Double => "小数",
-        Type::Float => "浮点",
-        Type::Bool => "布尔",
-        Type::Char => "字符",
-        Type::String => "字符串",
+        Type::Void => "无".to_string(),
+        Type::Int => "整数".to_string(),
+        Type::Double => "小数".to_string(),
+        Type::Float => "浮点".to_string(),
+        Type::Bool => "布尔".to_string(),
+        Type::Char => "字符".to_string(),
+        Type::String => "字符串".to_string(),
+        Type::Array {
+            element_type,
+            length,
+        } => match length {
+            Some(length) => format!("{}数组[{}]", type_name(element_type), length),
+            None => format!("{}数组", type_name(element_type)),
+        },
     }
 }
 
