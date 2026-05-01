@@ -41,6 +41,8 @@ pub struct FunctionDef {
     pub is_entry: bool,
     /// True if this function is implemented outside 问源 source.
     pub is_external: bool,
+    /// Explicit native symbol for an external function.
+    pub external_symbol: Option<String>,
     /// Function body statements.
     pub body: Vec<Stmt>,
 }
@@ -253,6 +255,8 @@ pub struct Parser {
     has_entry: bool,
     /// When true, the next function definition is an external declaration.
     next_is_external: bool,
+    /// Explicit native symbol for the next external function definition.
+    next_external_symbol: Option<String>,
     /// Current module path for following top-level function definitions.
     current_module: Option<String>,
 }
@@ -269,6 +273,7 @@ impl Parser {
             next_is_entry: false,
             has_entry: false,
             next_is_external: false,
+            next_external_symbol: None,
             current_module: None,
         }
     }
@@ -443,6 +448,7 @@ impl Parser {
             Token::External => {
                 self.advance();
                 self.next_is_external = true;
+                self.next_external_symbol = self.parse_optional_external_symbol()?;
                 Ok(())
             }
             Token::Error(message) => Err(self.lexical_error(message)),
@@ -454,6 +460,30 @@ impl Parser {
                 "如果要声明入口点，请写 `@声明 入口`；如果要声明外部函数，请写 `@声明 外部`。",
             )),
         }
+    }
+
+    fn parse_optional_external_symbol(&mut self) -> Result<Option<String>, String> {
+        if self.current != Token::LParen {
+            return Ok(None);
+        }
+
+        self.advance();
+        let symbol = match &self.current {
+            Token::StringLiteral(symbol) => {
+                let symbol = symbol.clone();
+                self.advance();
+                symbol
+            }
+            Token::Error(message) => return Err(self.lexical_error(message)),
+            other => {
+                return Err(self.error(
+                    format!("外部符号名必须是字符串，但找到了 `{}`", token_name(other)),
+                    "外部函数可以写成 `@声明 外部(\"rust_symbol\")`。",
+                ));
+            }
+        };
+        self.expect(&Token::RParen)?;
+        Ok(Some(symbol))
     }
 
     /// Parse a function definition:
@@ -496,6 +526,11 @@ impl Parser {
         }
 
         let is_external = self.next_is_external;
+        let external_symbol = if is_external {
+            self.next_external_symbol.take()
+        } else {
+            None
+        };
         if is_external {
             self.next_is_external = false;
         }
@@ -516,6 +551,7 @@ impl Parser {
             return_type,
             is_entry,
             is_external,
+            external_symbol,
             body,
         })
     }
@@ -2041,7 +2077,38 @@ mod tests {
         assert_eq!(func.name, "输出");
         assert!(func.is_external);
         assert!(!func.is_entry);
+        assert_eq!(func.external_symbol, None);
         assert!(func.body.is_empty());
         assert_eq!(func.params[0].param_type, Type::String);
+    }
+
+    #[test]
+    fn test_parse_external_function_declaration_with_symbol() {
+        let source = "#模块 Rust扩展\n@声明 外部(\"wen_add\")\n定义 方法 相加（左：整数，右：整数）返回 整数";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        assert_eq!(func.module_path, Some("Rust扩展".to_string()));
+        assert_eq!(func.name, "相加");
+        assert!(func.is_external);
+        assert_eq!(func.external_symbol, Some("wen_add".to_string()));
+        assert_eq!(func.params.len(), 2);
+        assert_eq!(func.return_type, Type::Int);
+    }
+
+    #[test]
+    fn test_parse_external_function_declaration_with_chinese_symbol_parens() {
+        let source =
+            "#模块 Rust扩展\n@声明 外部（\"wen_print\"）\n定义 方法 打印（内容：字符串）返回 无";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        assert!(func.is_external);
+        assert_eq!(func.external_symbol, Some("wen_print".to_string()));
+        assert_eq!(func.return_type, Type::Void);
     }
 }

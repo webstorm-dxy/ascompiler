@@ -3,6 +3,14 @@ name = "ascompiler"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [
+    ".",
+    "crates/wenyuan-ffi",
+    "crates/wenyuan-ffi-macros",
+    "examples/rust-ffi",
+]
+
 [[bin]]
 name = "asc"
 path = "src/main.rs"

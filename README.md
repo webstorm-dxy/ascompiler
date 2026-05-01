@@ -10,6 +10,7 @@
 - 支持模块、导入、函数声明和入口点检查。
 - 使用 `inkwell` 生成 LLVM IR 和本机目标文件。
 - 链接 `runtime/std_io.c`，提供基础输入输出运行时。
+- 支持通过 FFI 调用 Rust 编写的 `staticlib` 或 `cdylib`。
 - 可输出 LLVM IR，便于调试代码生成结果。
 
 ## 目录结构
@@ -22,12 +23,17 @@ src/
   semantic.rs   模块、导入和可调用对象的语义检查
   codegen.rs    LLVM IR 代码生成
   stdlib.rs     标准库合并逻辑
+crates/
+  wenyuan-ffi          Rust FFI 辅助类型和导出宏
+  wenyuan-ffi-macros   FFI 导出属性宏
 runtime/
   std_io.c      链接到最终程序的 C 运行时
 std/
   输入输出.as   问源标准库源码
 demo/
   *.as          示例程序
+examples/
+  rust-ffi      可被问源调用的 Rust FFI 示例库
 ```
 
 ## 编译要求
@@ -256,11 +262,134 @@ cargo run -- demo/test.as -o demo/test
 。。
 ```
 
+编译器命令行支持：
+
+```bash
+asc <源文件.as> [-o <输出文件>] [--ir] \
+  [--ffi-lib <库路径>] [--ffi-search <目录>] [--ffi-rpath <目录>]
+```
+
+- `--ir`：只打印 LLVM IR，不链接可执行文件。
+- `-o <输出文件>`：指定生成的可执行文件路径。
+- `--ffi-lib <库路径>`：链接一个外部库文件，可重复传入。
+- `--ffi-search <目录>`：添加库搜索路径，对应链接器的 `-L...`，可重复传入。
+- `--ffi-rpath <目录>`：在 Unix-like 系统上写入动态库运行时搜索路径，可重复传入。
+
+## Rust FFI
+
+问源可以声明外部符号并在链接阶段接入 Rust 生成的 `staticlib` 或
+`cdylib`。问源侧用 `@声明 外部("...")` 写出真实 native 符号名，然后用普通
+方法签名描述参数和返回类型：
+
+```text
+#模块 Rust扩展
+
+@声明 外部("wen_add")
+定义 方法 相加（左：整数，右：整数）返回 整数
+
+@声明 外部（"wen_print_text"）
+定义 方法 打印（内容：字符串）返回 无
+```
+
+Rust 侧可以使用本仓库提供的 `wenyuan-ffi`。在 Rust FFI crate 的
+`Cargo.toml` 中声明库类型：
+
+```toml
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+wenyuan-ffi = { path = "../../crates/wenyuan-ffi" }
+```
+
+然后用 `#[wenyuan_ffi::export(name = "...")]` 导出函数：
+
+```rust
+use wenyuan_ffi::AsStr;
+
+#[wenyuan_ffi::export(name = "wen_add")]
+fn add(left: i32, right: i32) -> i32 {
+    left + right
+}
+
+#[wenyuan_ffi::export(name = "wen_text_len")]
+fn text_len(text: AsStr) -> i32 {
+    text.to_str().map(|value| value.chars().count() as i32).unwrap_or(0)
+}
+
+#[wenyuan_ffi::export(name = "wen_print_text")]
+fn print_text(text: AsStr) {
+    println!("{}", text.to_string_lossy());
+}
+```
+
+v1 ABI 类型映射：
+
+- `整数` ↔ `i32`
+- `小数` ↔ `f64`
+- `浮点` ↔ `f32`
+- `布尔` ↔ `bool`
+- `字符` ↔ `u8`
+- `字符串` ↔ `wenyuan_ffi::AsStr` 或 `*const c_char`
+- `无` ↔ `()`
+
+构建并链接静态库示例：
+
+```bash
+cargo build -p wenyuan-rust-ffi-demo
+cargo run -p ascompiler --bin asc -- demo/ffi.as \
+  -o /tmp/wenyuan_ffi_demo \
+  --ffi-lib target/debug/libwenyuan_rust_ffi_demo.a
+```
+
+运行：
+
+```bash
+/tmp/wenyuan_ffi_demo
+```
+
+输出应类似：
+
+```text
+20 + 22 = 42
+文本长度 = 2
+来自 Rust FFI
+```
+
+链接动态库时传入动态库文件，并在 Unix-like 系统上设置 rpath。macOS 示例：
+
+```bash
+cargo run -p ascompiler --bin asc -- demo/ffi.as \
+  -o /tmp/wenyuan_ffi_demo_dyn \
+  --ffi-lib target/debug/libwenyuan_rust_ffi_demo.dylib \
+  --ffi-rpath target/debug
+```
+
+Linux 通常把动态库后缀改为 `.so`：
+
+```bash
+cargo run -p ascompiler --bin asc -- demo/ffi.as \
+  -o /tmp/wenyuan_ffi_demo_dyn \
+  --ffi-lib target/debug/libwenyuan_rust_ffi_demo.so \
+  --ffi-rpath target/debug
+```
+
+Windows 可传入 `.dll` 的 import library 或工具链支持的动态库路径。
+
+FFI v1 的限制：
+
+- 动态库支持是链接期 shared library 链接，不是运行时 `dlopen`。
+- 当前不把问源数组暴露给 Rust；后续可通过显式 slice ABI 扩展。
+- 问源传给 Rust 的字符串是借用的 C 字符串；Rust 返回自有字符串暂不在 v1
+  范围内。
+- `@声明 外部` 不写符号名时仍保留旧行为：标准库函数使用内置映射，其他外部
+  方法回退到编译器的 LLVM 名称清洗规则。
+
 ## 常用开发命令
 
 ```bash
 cargo fmt
-cargo test
+cargo test --workspace
 cargo build
 cargo build --release
 ```

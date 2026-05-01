@@ -900,4 +900,21 @@ mod tests {
         assert_eq!(lexer.next_token(), Token::VoidKw);
         assert_eq!(lexer.next_token(), Token::Eof);
     }
+
+    #[test]
+    fn test_external_declaration_with_symbol_uses_existing_tokens() {
+        let source = "@声明 外部（\"wen_add\"）";
+        let mut lexer = Lexer::new(source);
+
+        assert_eq!(lexer.next_token(), Token::At);
+        assert_eq!(lexer.next_token(), Token::Declare);
+        assert_eq!(lexer.next_token(), Token::External);
+        assert_eq!(lexer.next_token(), Token::LParen);
+        assert_eq!(
+            lexer.next_token(),
+            Token::StringLiteral("wen_add".to_string())
+        );
+        assert_eq!(lexer.next_token(), Token::RParen);
+        assert_eq!(lexer.next_token(), Token::Eof);
+    }
 }

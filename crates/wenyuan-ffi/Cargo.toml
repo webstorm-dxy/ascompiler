@@ -1,0 +1,9 @@
+[package]
+name = "wenyuan-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "Rust helpers for exporting functions to the Wenyuan language FFI."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+wenyuan-ffi-macros = { path = "../wenyuan-ffi-macros" }

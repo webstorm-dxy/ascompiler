@@ -86,6 +86,8 @@ fn sanitize_llvm_name(name: &str) -> String {
 fn llvm_function_name(func: &FunctionDef) -> String {
     if func.is_entry {
         "main".to_string()
+    } else if let Some(symbol) = &func.external_symbol {
+        symbol.clone()
     } else if func.is_external {
         stdlib::external_symbol_for(&semantic::function_path(func))
             .unwrap_or_else(|| sanitize_llvm_name(&semantic::function_path(func)))
@@ -104,19 +106,19 @@ fn declare_function<'ctx>(
         return Ok(function);
     }
 
-    let return_type: BasicTypeEnum = if func.is_entry {
-        context.i32_type().into()
-    } else {
-        as_llvm_type(&func.return_type, context)
-    };
-
     let param_types: Vec<BasicMetadataTypeEnum> = func
         .params
         .iter()
         .map(|p| as_llvm_type(&p.param_type, context).into())
         .collect();
 
-    let fn_type = return_type.fn_type(&param_types, false);
+    let fn_type = if func.is_entry {
+        context.i32_type().fn_type(&param_types, false)
+    } else if func.return_type == Type::Void {
+        context.void_type().fn_type(&param_types, false)
+    } else {
+        as_llvm_type(&func.return_type, context).fn_type(&param_types, false)
+    };
     Ok(module.add_function(&llvm_name, fn_type, None))
 }
 
@@ -197,8 +199,10 @@ fn compile_function<'ctx>(
         .is_none()
     {
         // Build default return instruction
-        if func.is_entry || func.return_type == Type::Void {
+        if func.is_entry {
             let _ = builder.build_return(Some(&context.i32_type().const_int(0, false)));
+        } else if func.return_type == Type::Void {
+            let _ = builder.build_return(None);
         } else {
             match func.return_type {
                 Type::Int => {
@@ -468,9 +472,15 @@ fn compile_return_stmt<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
 ) -> Result<(), String> {
-    if current_func.is_entry || current_func.return_type == Type::Void {
+    if current_func.is_entry {
         return builder
             .build_return(Some(&context.i32_type().const_int(0, false)))
+            .map(|_| ())
+            .map_err(|e| format!("build_return failed: {:?}", e));
+    }
+    if current_func.return_type == Type::Void {
+        return builder
+            .build_return(None)
             .map(|_| ())
             .map_err(|e| format!("build_return failed: {:?}", e));
     }
@@ -1933,4 +1943,55 @@ fn compile_execute<'ctx>(
         .map_err(|e| format!("build_call failed: {:?}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+    use inkwell::context::Context;
+
+    fn generate_ir(source: &str) -> String {
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("parse failed");
+        let context = Context::create();
+        let module = context.create_module("test");
+        generate(&program, &context, &module).expect("codegen failed");
+        module.verify().expect("module verification failed");
+        module.print_to_string().to_string()
+    }
+
+    #[test]
+    fn test_external_symbol_is_used_in_ir() {
+        let ir = generate_ir(
+            "#模块 Rust扩展
+@声明 外部(\"wen_add\")
+定义 方法 相加（左：整数，右：整数）返回 整数
+@声明 入口
+定义 方法 主（）返回 无：
+设 结果 = 相加（1，2）
+。。",
+        );
+
+        assert!(ir.contains("declare i32 @wen_add(i32, i32)"));
+        assert!(ir.contains("call i32 @wen_add"));
+    }
+
+    #[test]
+    fn test_external_void_function_uses_void_abi() {
+        let ir = generate_ir(
+            "#模块 Rust扩展
+@声明 外部(\"wen_print\")
+定义 方法 打印（内容：字符串）返回 无
+@声明 入口
+定义 方法 主（）返回 无：
+执行 打印：\"你好\"
+。。",
+        );
+
+        assert!(ir.contains("declare void @wen_print(ptr)"));
+        assert!(ir.contains("call void @wen_print"));
+    }
 }

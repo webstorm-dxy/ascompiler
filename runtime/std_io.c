@@ -26,8 +26,9 @@ char *as_format(const char *format, ...) {
     return buffer;
 }
 
-int as_std_io_output(const char *text) {
-    return puts(text);
+void as_std_io_output(const char *text) {
+    puts(text);
+    fflush(stdout);
 }
 
 int as_std_io_input_int(void) {
