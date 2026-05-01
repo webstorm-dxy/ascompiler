@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "ascompiler",
+    "salt",
     "wenyuan-ffi",
     "wenyuan-ffi-macros",
     "examples/rust-ffi",

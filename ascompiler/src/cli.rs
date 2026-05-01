@@ -10,18 +10,18 @@ use std::path::PathBuf;
 use std::process::{self, Command};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct FfiLinkOptions {
-    libs: Vec<PathBuf>,
-    search_paths: Vec<PathBuf>,
-    rpaths: Vec<PathBuf>,
+pub struct FfiLinkOptions {
+    pub libs: Vec<PathBuf>,
+    pub search_paths: Vec<PathBuf>,
+    pub rpaths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CompileOptions {
-    input_path: PathBuf,
-    output_path: PathBuf,
-    ir_mode: bool,
-    ffi: FfiLinkOptions,
+pub struct CompileOptions {
+    pub input_path: PathBuf,
+    pub output_path: PathBuf,
+    pub ir_mode: bool,
+    pub ffi: FfiLinkOptions,
 }
 
 pub fn run(args: Vec<String>) {
@@ -57,7 +57,7 @@ pub fn run(args: Vec<String>) {
     compile_source(source, options);
 }
 
-fn compile_source(source: String, options: CompileOptions) {
+pub fn compile_source(source: String, options: CompileOptions) {
     let input_path = options.input_path;
     let output_path = options.output_path;
     let ir_mode = options.ir_mode;
@@ -145,7 +145,7 @@ fn emit_and_link(
         .write_to_file(module, FileType::Object, &obj_path)
         .expect("写入目标文件失败");
 
-    let mut command = Command::new("cc");
+    let mut command = Command::new(command_path("cc", &["/usr/bin/cc", "/bin/cc"]));
     command.arg(&obj_path).arg(runtime_source_path());
     append_ffi_link_args(&mut command, ffi);
     command.arg("-o").arg(output_path);
@@ -186,6 +186,16 @@ fn append_rpath_arg(_command: &mut Command, _rpath: &PathBuf) {}
 
 fn runtime_source_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../runtime/std_io.c")
+}
+
+fn command_path(name: &str, fallbacks: &[&str]) -> PathBuf {
+    for fallback in fallbacks {
+        let path = PathBuf::from(fallback);
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from(name)
 }
 
 fn parse_args(args: &[String]) -> Result<CompileOptions, String> {
