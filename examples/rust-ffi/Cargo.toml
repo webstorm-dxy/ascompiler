@@ -1,11 +1,11 @@
 [package]
 name = "wenyuan-rust-ffi-demo"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 publish = false
 
 [lib]
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-wenyuan-ffi = { path = "../../crates/wenyuan-ffi" }
+wenyuan-ffi.workspace = true

@@ -185,7 +185,7 @@ fn append_rpath_arg(command: &mut Command, rpath: &PathBuf) {
 fn append_rpath_arg(_command: &mut Command, _rpath: &PathBuf) {}
 
 fn runtime_source_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/std_io.c")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../runtime/std_io.c")
 }
 
 fn parse_args(args: &[String]) -> Result<CompileOptions, String> {

@@ -4,7 +4,7 @@ use crate::parser::{Parser, Program};
 pub const STD_IO_OUTPUT_PATH: &str = "标准库-输入输出-输出";
 pub const STD_IO_INPUT_PATH: &str = "标准库-输入输出-获取输入";
 
-const STANDARD_LIBRARY_SOURCES: &[&str] = &[include_str!("../std/输入输出.as")];
+const STANDARD_LIBRARY_SOURCES: &[&str] = &[include_str!("../../std/输入输出.as")];
 
 pub fn parse_standard_library() -> Result<Program, String> {
     let mut std_program = empty_program();

@@ -16,16 +16,21 @@
 ## 目录结构
 
 ```text
-src/
-  main.rs       命令行入口和完整编译流程
-  lexer.rs      词法分析器
-  parser.rs     AST 定义和语法分析器
-  semantic.rs   模块、导入和可调用对象的语义检查
-  codegen.rs    LLVM IR 代码生成
-  stdlib.rs     标准库合并逻辑
-crates/
-  wenyuan-ffi          Rust FFI 辅助类型和导出宏
-  wenyuan-ffi-macros   FFI 导出属性宏
+Cargo.toml      workspace 清单
+ascompiler/
+  Cargo.toml    主编译器 crate，生成 asc 命令
+  src/
+    main.rs       命令行入口
+    cli.rs        编译流程和链接流程
+    lexer.rs      词法分析器
+    parser.rs     AST 定义和语法分析器
+    semantic.rs   模块、导入和可调用对象的语义检查
+    codegen.rs    LLVM IR 代码生成
+    stdlib.rs     标准库合并逻辑
+wenyuan-ffi/
+  src/          Rust FFI 辅助类型和导出宏
+wenyuan-ffi-macros/
+  src/          FFI 导出属性宏
 runtime/
   std_io.c      链接到最终程序的 C 运行时
 std/
@@ -239,19 +244,19 @@ Visual Studio C++ 工具链都加入了 `PATH`。
 输出示例程序的 LLVM IR：
 
 ```bash
-cargo run -- demo/test.as --ir
+cargo run -- demo/condition.as --ir
 ```
 
 编译示例程序为本机可执行文件：
 
 ```bash
-cargo run -- demo/test.as -o demo/test
+cargo run -- demo/condition.as -o /tmp/wenyuan_condition
 ```
 
 运行生成的程序：
 
 ```bash
-./demo/test
+/tmp/wenyuan_condition
 ```
 
 入口函数需要使用 `@声明 入口` 标记，例如：
@@ -299,7 +304,7 @@ Rust 侧可以使用本仓库提供的 `wenyuan-ffi`。在 Rust FFI crate 的
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-wenyuan-ffi = { path = "../../crates/wenyuan-ffi" }
+wenyuan-ffi = { path = "../../wenyuan-ffi" }
 ```
 
 然后用 `#[wenyuan_ffi::export(name = "...")]` 导出函数：
@@ -392,6 +397,7 @@ cargo fmt
 cargo test --workspace
 cargo build
 cargo build --release
+cargo run -- demo/condition.as --ir
 ```
 
 ## 常见问题

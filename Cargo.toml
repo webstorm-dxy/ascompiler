@@ -1,19 +1,19 @@
-[package]
-name = "ascompiler"
+[workspace]
+resolver = "3"
+members = [
+    "ascompiler",
+    "wenyuan-ffi",
+    "wenyuan-ffi-macros",
+    "examples/rust-ffi",
+]
+default-members = ["ascompiler"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[workspace]
-members = [
-    ".",
-    "crates/wenyuan-ffi",
-    "crates/wenyuan-ffi-macros",
-    "examples/rust-ffi",
-]
-
-[[bin]]
-name = "asc"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
+ascompiler = { path = "ascompiler" }
 inkwell = { version = "0.8", features = ["llvm20-1", "target-aarch64"] }
+wenyuan-ffi = { path = "wenyuan-ffi" }
+wenyuan-ffi-macros = { path = "wenyuan-ffi-macros" }

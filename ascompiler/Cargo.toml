@@ -1,0 +1,11 @@
+[package]
+name = "ascompiler"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "asc"
+path = "src/main.rs"
+
+[dependencies]
+inkwell.workspace = true

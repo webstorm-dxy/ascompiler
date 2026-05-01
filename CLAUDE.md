@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build                  # compile (binary: target/debug/asc)
 cargo build --release        # optimized build (binary: target/release/asc)
 cargo run -- <source.as>     # compile + run with args
-cargo test                   # run all tests
+cargo test --workspace       # run all tests
 ```
 
 ## Usage
@@ -22,11 +22,11 @@ asc 源文件.as -o 输出         # compile to named executable
 
 A Chinese-language ("问源") imperative language compiler targeting LLVM via `inkwell` (Rust LLVM bindings). Pipeline:
 
-1. **Lexer** (`src/lexer.rs`) — tokenization, handles Chinese/English punctuation and CJK keywords
-2. **Parser** (`src/parser.rs`) — syntax analysis, produces AST
-3. **Codegen** (`src/codegen.rs`) — walks AST, emits LLVM IR via inkwell
+1. **Lexer** (`ascompiler/src/lexer.rs`) — tokenization, handles Chinese/English punctuation and CJK keywords
+2. **Parser** (`ascompiler/src/parser.rs`) — syntax analysis, produces AST
+3. **Codegen** (`ascompiler/src/codegen.rs`) — walks AST, emits LLVM IR via inkwell
 
-`main.rs` wires the pipeline end-to-end: reads `.as` source file → lex → parse → codegen → emit object file → link to native executable via `cc`.
+`ascompiler/src/main.rs` is the binary entrypoint, and `ascompiler/src/cli.rs` wires the pipeline end-to-end: reads `.as` source file → lex → parse → codegen → emit object file → link to native executable via `cc`.
 
 ## LLVM / Inkwell Conventions
 
