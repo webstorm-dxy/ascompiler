@@ -1,0 +1,7 @@
+[package]
+name = "salt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ascompiler.workspace = true

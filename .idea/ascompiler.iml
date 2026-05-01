@@ -12,6 +12,7 @@
       <sourceFolder url="file://$MODULE_DIR$/wenyuan-ffi-macros/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/wenyuan-ffi/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/wenyuan-ffi/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/salt/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
