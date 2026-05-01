@@ -184,6 +184,59 @@ fn validate_stmt(
                 }
             }
         }
+        Stmt::Select(select_stmt) => {
+            let target_type = locals
+                .get(&select_stmt.target)
+                .map(|local| local.ty.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "未定义的变量 `{}`\n  = 帮助: `当前` 后面只能接当前作用域内已声明的变量。",
+                        select_stmt.target
+                    )
+                })?;
+
+            for case in &select_stmt.cases {
+                let value_type = validate_expr(&case.value, program, func, scoped_imports, locals)?;
+                if value_type != target_type {
+                    return Err(format!(
+                        "选择分支类型不匹配\n  = 当前变量 `{}`: {}\n  = 取值: {}",
+                        select_stmt.target,
+                        type_name(&target_type),
+                        type_name(&value_type)
+                    ));
+                }
+
+                let mut branch_locals = locals.clone();
+                let mut branch_imports = scoped_imports.clone();
+                for stmt in &case.body {
+                    validate_stmt(
+                        stmt,
+                        program,
+                        func,
+                        registry,
+                        &mut branch_imports,
+                        &mut branch_locals,
+                        source_context,
+                    )?;
+                }
+            }
+
+            if let Some(body) = &select_stmt.default_body {
+                let mut branch_locals = locals.clone();
+                let mut branch_imports = scoped_imports.clone();
+                for stmt in body {
+                    validate_stmt(
+                        stmt,
+                        program,
+                        func,
+                        registry,
+                        &mut branch_imports,
+                        &mut branch_locals,
+                        source_context,
+                    )?;
+                }
+            }
+        }
         Stmt::Loop(loop_stmt) => match loop_stmt {
             crate::parser::LoopStmt::Count {
                 var_name,
@@ -291,8 +344,28 @@ fn validate_var_decl(
     scoped_imports: &[ImportDecl],
     locals: &mut HashMap<String, LocalInfo>,
 ) -> Result<(), String> {
-    let inferred_type = validate_expr(&var.init, program, func, scoped_imports, locals)?;
-    let var_type = var.var_type.clone().unwrap_or(inferred_type);
+    let var_type = match (&var.var_type, &var.init) {
+        (Some(var_type), Some(init)) => {
+            let inferred_type = validate_expr(init, program, func, scoped_imports, locals)?;
+            if &inferred_type != var_type {
+                return Err(format!(
+                    "变量初始化类型不匹配: `{}`\n  = 声明类型: {}\n  = 表达式类型: {}\n  = 帮助: 请让初始化表达式返回相同类型，或调整变量的声明类型。",
+                    var.name,
+                    type_name(var_type),
+                    type_name(&inferred_type)
+                ));
+            }
+            var_type.clone()
+        }
+        (Some(var_type), None) => var_type.clone(),
+        (None, Some(init)) => validate_expr(init, program, func, scoped_imports, locals)?,
+        (None, None) => {
+            return Err(format!(
+                "预定义变量 `{}` 缺少类型\n  = 帮助: 预定义变量需要写出类型，例如 `定义 变量：整数{}`。",
+                var.name, var.name
+            ));
+        }
+    };
     locals.insert(
         var.name.clone(),
         LocalInfo {
@@ -415,7 +488,11 @@ fn validate_expr(
                     name
                 )
             }),
-        Expr::Call { target, args } => {
+        Expr::Call {
+            target,
+            type_arg,
+            args,
+        } => {
             let resolved = resolve_execute_target(program, func, scoped_imports, target)
                 .ok_or_else(|| format!("未找到模块或方法 `{}`\n  = 帮助: 如果这是外部模块中的方法，请先写 `引用 模块：路径`，或使用引用别名。", target))?;
             let called_func = program
@@ -428,6 +505,16 @@ fn validate_expr(
                     "方法 `{}` 没有返回值\n  = 实际返回类型: 无\n  = 帮助: `无` 返回值的方法只能用 `执行` 调用，不能放在表达式里。",
                     target
                 ));
+            }
+            if let Some(type_arg) = type_arg {
+                if type_arg != &called_func.return_type {
+                    return Err(format!(
+                        "方法 `{}` 的泛型类型不匹配\n  = `->` 指定: {}\n  = 实际返回: {}",
+                        target,
+                        type_name(type_arg),
+                        type_name(&called_func.return_type)
+                    ));
+                }
             }
             if args.len() != called_func.params.len() {
                 return Err(format!(
@@ -818,6 +905,27 @@ mod tests {
     }
 
     #[test]
+    fn test_select_cases_must_match_target_type() {
+        let source = "定义 方法 测试（）返回 无：设 x=1 当前x：取“不是整数”：返回。。。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        let err = analyze(&program).expect_err("Expected semantic error");
+        assert!(err.contains("选择分支类型不匹配"));
+    }
+
+    #[test]
+    fn test_select_accepts_string_cases() {
+        let source = "定义 方法 测试（）返回 无：设 名字=\"问源\" 当前 名字：取“问源”：返回 此外：返回。。。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
     fn test_assignment_and_return_in_iterate_loop() {
         let source =
             "定义 方法 求和（）返回 整数：设 cnt = 0 循环迭代i<1..5：cnt=cnt+i。。返回 cnt。。";
@@ -850,6 +958,27 @@ mod tests {
     }
 
     #[test]
+    fn test_predefined_variable_is_mutable_by_default() {
+        let source = "定义 方法 测试（）返回 无：定义变量：整数x x=10 x=11。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_predefined_variable_requires_explicit_type() {
+        let source = "定义 方法 测试（）返回 无：定义变量：x x=10。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        let err = analyze(&program).expect_err("Expected missing type error");
+        assert!(err.contains("预定义变量 `x` 缺少类型"));
+    }
+
+    #[test]
     fn test_function_call_expression_uses_return_type() {
         let source = "定义 方法 从零求和（结束值：整数）返回 整数：返回 结束值。。定义 方法 测试（）返回 无：设 s = 从零求和（10）。。";
         let program = Parser::new(Lexer::new(source))
@@ -857,5 +986,28 @@ mod tests {
             .expect("Parse failed");
 
         analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_take_value_input_int_uses_std_return_type() {
+        let source = "引用 模块：标准库-输入输出-获取输入 为 获取输入\n定义 方法 测试（）返回 无：设 s = 取值 获取输入->整数：“输入提示词”。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+        let program = stdlib::merge_with_standard_library(program).expect("std merge failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_take_value_generic_type_must_match_return_type() {
+        let source = "引用 模块：标准库-输入输出-获取输入 为 获取输入\n定义 方法 测试（）返回 无：设 s = 取值 获取输入->字符串：“输入提示词”。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+        let program = stdlib::merge_with_standard_library(program).expect("std merge failed");
+
+        let err = analyze(&program).expect_err("Expected generic mismatch");
+        assert!(err.contains("泛型类型不匹配"));
     }
 }

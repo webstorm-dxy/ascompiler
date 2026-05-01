@@ -1,7 +1,7 @@
 /// Code generation: walks the AST and emits LLVM IR via inkwell.
 use crate::parser::{
     AssignStmt, BinaryOp, ExecuteStmt, Expr, FormatPart, FunctionDef, IfStmt, ImportDecl, LoopStmt,
-    Program, ReturnStmt, Stmt, Type, UnaryOp, VarDecl,
+    Program, ReturnStmt, SelectStmt, Stmt, Type, UnaryOp, VarDecl,
 };
 use crate::semantic;
 use crate::stdlib;
@@ -13,7 +13,9 @@ use inkwell::module::Module;
 use inkwell::types::BasicMetadataTypeEnum;
 use inkwell::types::BasicType;
 use inkwell::types::BasicTypeEnum;
-use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -289,6 +291,17 @@ fn compile_stmt<'ctx>(
             context,
             module,
         ),
+        Stmt::Select(select_stmt) => compile_select_stmt(
+            select_stmt,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            function,
+            builder,
+            context,
+            module,
+        ),
         Stmt::Loop(loop_stmt) => compile_loop_stmt(
             loop_stmt,
             current_func,
@@ -317,7 +330,13 @@ fn compile_var_decl<'ctx>(
     // Determine the LLVM type
     let var_type = match &var.var_type {
         Some(t) => t.clone(),
-        None => infer_type_from_expr(&var.init, current_func, program, scoped_imports, locals)?,
+        None => {
+            let init = var
+                .init
+                .as_ref()
+                .ok_or_else(|| format!("预定义变量缺少类型: {}", var.name))?;
+            infer_type_from_expr(init, current_func, program, scoped_imports, locals)?
+        }
     };
     let llvm_type = as_llvm_type(&var_type, context);
 
@@ -327,18 +346,22 @@ fn compile_var_decl<'ctx>(
         .build_alloca(llvm_type, &sanitized_name)
         .map_err(|e| format!("build_alloca failed: {:?}", e))?;
 
-    // Compile initializer value and store
-    let value = compile_expr(
-        &var.init,
-        current_func,
-        program,
-        scoped_imports,
-        locals,
-        builder,
-        context,
-        module,
-    )?;
-    let _ = builder.build_store(alloca, value);
+    // Compile initializer value and store when this declaration has one.
+    if let Some(init) = &var.init {
+        let value = compile_expr(
+            init,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        )?;
+        builder
+            .build_store(alloca, value)
+            .map_err(|e| format!("build_store failed: {:?}", e))?;
+    }
     locals.insert(
         var.name.clone(),
         LocalValue::Pointer(alloca, var_type, var.is_mutable),
@@ -526,6 +549,183 @@ fn compile_if_stmt<'ctx>(
 
     builder.position_at_end(merge_block);
     Ok(())
+}
+
+fn compile_select_stmt<'ctx>(
+    select_stmt: &SelectStmt,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &mut Vec<ImportDecl>,
+    locals: &mut HashMap<String, LocalValue<'ctx>>,
+    function: &FunctionValue<'ctx>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(), String> {
+    let target_local = locals
+        .get(&select_stmt.target)
+        .cloned()
+        .ok_or_else(|| format!("未定义的变量: {}", select_stmt.target))?;
+    let target_type = local_type(&target_local);
+    let merge_block = context.append_basic_block(*function, "select.end");
+    let mut next_case_block = None;
+    let mut default_block_to_compile = None;
+
+    for (index, case) in select_stmt.cases.iter().enumerate() {
+        if let Some(block) = next_case_block.take() {
+            builder.position_at_end(block);
+        }
+
+        let case_body_block =
+            context.append_basic_block(*function, &format!("select.case.{}", index));
+        let fallback_block = if index + 1 == select_stmt.cases.len() {
+            if select_stmt.default_body.is_some() {
+                let block = context.append_basic_block(*function, "select.default");
+                default_block_to_compile = Some(block);
+                block
+            } else {
+                merge_block
+            }
+        } else {
+            let block =
+                context.append_basic_block(*function, &format!("select.check.{}", index + 1));
+            next_case_block = Some(block);
+            block
+        };
+
+        let condition = compile_select_case_condition(
+            &target_local,
+            &target_type,
+            &case.value,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        )?;
+        builder
+            .build_conditional_branch(condition, case_body_block, fallback_block)
+            .map_err(|e| format!("build_conditional_branch failed: {:?}", e))?;
+
+        builder.position_at_end(case_body_block);
+        let mut branch_imports = scoped_imports.clone();
+        let mut branch_locals = locals.clone();
+        for stmt in &case.body {
+            compile_stmt(
+                stmt,
+                current_func,
+                program,
+                &mut branch_imports,
+                &mut branch_locals,
+                function,
+                builder,
+                context,
+                module,
+            )?;
+        }
+        if builder
+            .get_insert_block()
+            .and_then(|block| block.get_terminator())
+            .is_none()
+        {
+            builder
+                .build_unconditional_branch(merge_block)
+                .map_err(|e| format!("build_unconditional_branch failed: {:?}", e))?;
+        }
+    }
+
+    if let Some(default_body) = &select_stmt.default_body {
+        if let Some(block) = default_block_to_compile {
+            builder.position_at_end(block);
+        }
+        let mut branch_imports = scoped_imports.clone();
+        let mut branch_locals = locals.clone();
+        for stmt in default_body {
+            compile_stmt(
+                stmt,
+                current_func,
+                program,
+                &mut branch_imports,
+                &mut branch_locals,
+                function,
+                builder,
+                context,
+                module,
+            )?;
+        }
+        if builder
+            .get_insert_block()
+            .and_then(|block| block.get_terminator())
+            .is_none()
+        {
+            builder
+                .build_unconditional_branch(merge_block)
+                .map_err(|e| format!("build_unconditional_branch failed: {:?}", e))?;
+        }
+    }
+
+    builder.position_at_end(merge_block);
+    Ok(())
+}
+
+fn compile_select_case_condition<'ctx>(
+    target_local: &LocalValue<'ctx>,
+    target_type: &Type,
+    case_value: &Expr,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<IntValue<'ctx>, String> {
+    let target_value = load_local_value(target_local.clone(), "select.target", builder, context)?;
+    let case_value = compile_expr(
+        case_value,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
+
+    match target_type {
+        Type::String => {
+            let strcmp = declare_strcmp_function(context, module);
+            let result = builder
+                .build_call(
+                    strcmp,
+                    &[target_value.into(), case_value.into()],
+                    "select.strcmp",
+                )
+                .map_err(|e| format!("build_call failed: {:?}", e))?
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_int_value();
+            builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    result,
+                    context.i32_type().const_zero(),
+                    "select.str.eq",
+                )
+                .map_err(|e| format!("build_int_compare failed: {:?}", e))
+        }
+        Type::Int | Type::Bool | Type::Char => builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                target_value.into_int_value(),
+                case_value.into_int_value(),
+                "select.eq",
+            )
+            .map_err(|e| format!("build_int_compare failed: {:?}", e)),
+        other => Err(format!("暂不支持对 {} 类型使用选择语句", type_name(other))),
+    }
 }
 
 fn compile_loop_stmt<'ctx>(
@@ -913,7 +1113,7 @@ fn compile_expr<'ctx>(
                 .ok_or_else(|| format!("未定义的变量: {}", name))?;
             load_local_value(local.clone(), name, builder, context)
         }
-        Expr::Call { target, args } => compile_call_expr(
+        Expr::Call { target, args, .. } => compile_call_expr(
             target,
             args,
             current_func,
@@ -1334,6 +1534,18 @@ fn local_type<'ctx>(local: &LocalValue<'ctx>) -> Type {
     }
 }
 
+fn type_name(ty: &Type) -> &'static str {
+    match ty {
+        Type::Void => "无",
+        Type::Int => "整数",
+        Type::Double => "小数",
+        Type::Float => "浮点",
+        Type::Bool => "布尔",
+        Type::Char => "字符",
+        Type::String => "字符串",
+    }
+}
+
 fn load_local_value<'ctx>(
     local: LocalValue<'ctx>,
     name: &str,
@@ -1362,6 +1574,21 @@ fn declare_format_function<'ctx>(
     let ptr_type = context.ptr_type(AddressSpace::from(0u16));
     let fn_type = ptr_type.fn_type(&[ptr_type.into()], true);
     module.add_function("as_format", fn_type, None)
+}
+
+fn declare_strcmp_function<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> FunctionValue<'ctx> {
+    if let Some(function) = module.get_function("strcmp") {
+        return function;
+    }
+
+    let ptr_type = context.ptr_type(AddressSpace::from(0u16));
+    let fn_type = context
+        .i32_type()
+        .fn_type(&[ptr_type.into(), ptr_type.into()], false);
+    module.add_function("strcmp", fn_type, None)
 }
 
 fn compile_execute<'ctx>(

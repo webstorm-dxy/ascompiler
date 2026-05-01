@@ -21,6 +21,10 @@ pub enum Token {
     If,        // 判断
     ElseIf,    // 若
     Else,      // 否则
+    Current,   // 当前
+    Case,      // 取
+    Otherwise, // 此外
+    TakeValue, // 取值
     Loop,      // 循环
     Count,     // 计数
     Condition, // 条件
@@ -68,6 +72,7 @@ pub enum Token {
     AndAnd,    // &&
     OrOr,      // ||
     Bang,      // !
+    Arrow,     // ->
 
     // Values
     Ident(String),
@@ -202,6 +207,9 @@ impl Lexer {
                     ['返', '回'] => Some(Token::ReturnKw),
                     ['判', '断'] => Some(Token::If),
                     ['否', '则'] => Some(Token::Else),
+                    ['当', '前'] => Some(Token::Current),
+                    ['取', '值'] => Some(Token::TakeValue),
+                    ['此', '外'] => Some(Token::Otherwise),
                     ['循', '环'] => Some(Token::Loop),
                     ['计', '数'] => Some(Token::Count),
                     ['条', '件'] => Some(Token::Condition),
@@ -244,6 +252,10 @@ impl Lexer {
         if ch1 == '若' {
             self.advance();
             return Some(Token::ElseIf);
+        }
+        if ch1 == '取' {
+            self.advance();
+            return Some(Token::Case);
         }
         if ch1 == '且' {
             self.advance();
@@ -292,6 +304,9 @@ impl Lexer {
                         | ['返', '回']
                         | ['判', '断']
                         | ['否', '则']
+                        | ['当', '前']
+                        | ['取', '值']
+                        | ['此', '外']
                         | ['循', '环']
                         | ['计', '数']
                         | ['条', '件']
@@ -313,7 +328,13 @@ impl Lexer {
         }
 
         // Check 1-char keyword
-        ch1 == '无' || ch1 == '设' || ch1 == '为' || ch1 == '若' || ch1 == '且' || ch1 == '或'
+        ch1 == '无'
+            || ch1 == '设'
+            || ch1 == '为'
+            || ch1 == '若'
+            || ch1 == '取'
+            || ch1 == '且'
+            || ch1 == '或'
     }
 
     /// Read an integer literal starting at the current position.
@@ -404,6 +425,9 @@ impl Lexer {
                 if !prev_is_cjk || !next_is_cjk {
                     break;
                 }
+            }
+            if ch == '为' {
+                break;
             }
             // If a new identifier would start with a keyword, stop. Once an
             // identifier has started, keyword text may be part of the name.
@@ -504,7 +528,12 @@ impl Lexer {
             }
             '-' => {
                 self.advance();
-                Token::Minus
+                if self.current() == Some('>') {
+                    self.advance();
+                    Token::Arrow
+                } else {
+                    Token::Minus
+                }
             }
             '*' => {
                 self.advance();
@@ -699,6 +728,41 @@ mod tests {
     }
 
     #[test]
+    fn test_take_value_generic_input_tokens() {
+        let source = "取值 获取输入->整数：“输入提示词”";
+        let mut lexer = Lexer::new(source);
+
+        assert_eq!(lexer.next_token(), Token::TakeValue);
+        assert_eq!(lexer.next_token(), Token::Ident("获取输入".to_string()));
+        assert_eq!(lexer.next_token(), Token::Arrow);
+        assert_eq!(lexer.next_token(), Token::IntKw);
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(
+            lexer.next_token(),
+            Token::StringLiteral("输入提示词".to_string())
+        );
+    }
+
+    #[test]
+    fn test_chinese_assignment_operator_without_spaces() {
+        let source = "设输入内容为取值 获取输入->整数：“请输入一个数”";
+        let mut lexer = Lexer::new(source);
+
+        assert_eq!(lexer.next_token(), Token::Let);
+        assert_eq!(lexer.next_token(), Token::Ident("输入内容".to_string()));
+        assert_eq!(lexer.next_token(), Token::AsKw);
+        assert_eq!(lexer.next_token(), Token::TakeValue);
+        assert_eq!(lexer.next_token(), Token::Ident("获取输入".to_string()));
+        assert_eq!(lexer.next_token(), Token::Arrow);
+        assert_eq!(lexer.next_token(), Token::IntKw);
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(
+            lexer.next_token(),
+            Token::StringLiteral("请输入一个数".to_string())
+        );
+    }
+
+    #[test]
     fn test_condition_keywords_and_cpp_operators() {
         let source = "判断x>=10&&x!=20：若 y<3||!z：判断 a 且 b 或 c：否则：";
         let mut lexer = Lexer::new(source);
@@ -729,6 +793,21 @@ mod tests {
         assert_eq!(lexer.next_token(), Token::Colon);
         assert_eq!(lexer.next_token(), Token::Else);
         assert_eq!(lexer.next_token(), Token::Colon);
+    }
+
+    #[test]
+    fn test_select_keywords_without_spaces() {
+        let source = "当前x：取1：此外：。。";
+        let mut lexer = Lexer::new(source);
+        assert_eq!(lexer.next_token(), Token::Current);
+        assert_eq!(lexer.next_token(), Token::Ident("x".to_string()));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::Case);
+        assert_eq!(lexer.next_token(), Token::IntLiteral(1));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::Otherwise);
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::ScopeEnd);
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub enum Stmt {
     Import(ImportDecl),
     Execute(ExecuteStmt),
     If(IfStmt),
+    Select(SelectStmt),
     Loop(LoopStmt),
 }
 
@@ -87,8 +88,8 @@ pub struct VarDecl {
     pub var_type: Option<Type>,
     /// True when the variable can be assigned after declaration.
     pub is_mutable: bool,
-    /// Initializer expression.
-    pub init: Expr,
+    /// Optional initializer expression.
+    pub init: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +101,19 @@ pub struct IfStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfBranch {
     pub condition: Expr,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectStmt {
+    pub target: String,
+    pub cases: Vec<SelectCase>,
+    pub default_body: Option<Vec<Stmt>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectCase {
+    pub value: Expr,
     pub body: Vec<Stmt>,
 }
 
@@ -130,6 +144,7 @@ pub enum Expr {
     Ident(String),
     Call {
         target: String,
+        type_arg: Option<Type>,
         args: Vec<Expr>,
     },
     Unary {
@@ -286,6 +301,24 @@ impl Parser {
                 ),
             ))
         }
+    }
+
+    fn expect_assignment_operator(&mut self) -> Result<(), String> {
+        match &self.current {
+            Token::Equals | Token::AsKw => {
+                self.advance();
+                Ok(())
+            }
+            Token::Error(message) => Err(self.lexical_error(message)),
+            other => Err(self.error(
+                format!("期望赋值符号 `=` 或 `为`，但找到了 `{}`", token_name(other)),
+                "赋值可以写成 `名称=表达式`，也可以写成 `名称为表达式`。",
+            )),
+        }
+    }
+
+    fn is_assignment_operator(&self) -> bool {
+        matches!(self.current, Token::Equals | Token::AsKw)
     }
 
     /// Expect an identifier, return its value.
@@ -547,6 +580,18 @@ impl Parser {
         Ok(stmts)
     }
 
+    fn parse_statements_until_select_boundary(&mut self) -> Result<Vec<Stmt>, String> {
+        let mut stmts = Vec::new();
+        while !matches!(
+            self.current,
+            Token::Case | Token::Otherwise | Token::ScopeEnd | Token::Eof
+        ) {
+            let stmt = self.parse_stmt()?;
+            stmts.push(stmt);
+        }
+        Ok(stmts)
+    }
+
     /// Parse a single statement.
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
         match &self.current {
@@ -557,11 +602,12 @@ impl Parser {
             Token::Import => self.parse_import_decl().map(Stmt::Import),
             Token::Execute => self.parse_execute_stmt().map(Stmt::Execute),
             Token::If => self.parse_if_stmt().map(Stmt::If),
+            Token::Current => self.parse_select_stmt().map(Stmt::Select),
             Token::Loop => self.parse_loop_stmt().map(Stmt::Loop),
             Token::Error(message) => Err(self.lexical_error(message)),
             other => Err(self.error(
                 format!("方法体内不能以 `{}` 开始一条语句", token_name(other)),
-                "这里可以写变量定义、赋值、返回、执行、判断、循环或局部引用语句。",
+                "这里可以写变量定义、赋值、返回、执行、判断、选择、循环或局部引用语句。",
             )),
         }
     }
@@ -594,6 +640,44 @@ impl Parser {
         Ok(IfStmt {
             branches,
             else_body,
+        })
+    }
+
+    /// Parse `当前x：取1：...此外：...。。`.
+    fn parse_select_stmt(&mut self) -> Result<SelectStmt, String> {
+        self.expect(&Token::Current)?;
+        let target = self.expect_ident()?;
+        self.expect(&Token::Colon)?;
+
+        let mut cases = Vec::new();
+        while self.current == Token::Case {
+            self.advance();
+            let value = self.parse_expr()?;
+            self.expect(&Token::Colon)?;
+            let body = self.parse_statements_until_select_boundary()?;
+            cases.push(SelectCase { value, body });
+        }
+
+        if cases.is_empty() {
+            return Err(self.error(
+                "`当前` 选择语句至少需要一个 `取` 分支",
+                "选择语句形如 `当前x：取1：...此外：...。。`。",
+            ));
+        }
+
+        let default_body = if self.current == Token::Otherwise {
+            self.advance();
+            self.expect(&Token::Colon)?;
+            Some(self.parse_statements_until_select_boundary()?)
+        } else {
+            None
+        };
+
+        self.expect(&Token::ScopeEnd)?;
+        Ok(SelectStmt {
+            target,
+            cases,
+            default_body,
         })
     }
 
@@ -648,11 +732,12 @@ impl Parser {
         }
     }
 
-    /// Parse a variable declaration: `定义 [可变] 变量： [type] name = expr`
+    /// Parse a variable declaration:
+    /// `定义 [可变] 变量： [type] name (=|为) expr` or `定义 变量： type name`.
     fn parse_var_decl(&mut self) -> Result<VarDecl, String> {
         let start = self.current_span.start;
         self.expect(&Token::Define)?;
-        let is_mutable = if self.current == Token::Mutable {
+        let explicit_mutable = if self.current == Token::Mutable {
             self.advance();
             true
         } else {
@@ -668,8 +753,13 @@ impl Parser {
         }
 
         let (name, name_span) = self.expect_ident_span()?;
-        self.expect(&Token::Equals)?;
-        let init = self.parse_expr()?;
+        let init = if self.is_assignment_operator() {
+            self.expect_assignment_operator()?;
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let is_mutable = explicit_mutable || init.is_none();
         let span = Span {
             start,
             end: self.current_span.start.max(name_span.end),
@@ -685,13 +775,13 @@ impl Parser {
         })
     }
 
-    /// Parse a simplified variable declaration: `设 name = expr`.
+    /// Parse a simplified variable declaration: `设 name (=|为) expr`.
     /// `设` variables are mutable by default.
     fn parse_let_stmt(&mut self) -> Result<VarDecl, String> {
         let start = self.current_span.start;
         self.expect(&Token::Let)?;
         let (name, name_span) = self.expect_ident_span()?;
-        self.expect(&Token::Equals)?;
+        self.expect_assignment_operator()?;
         let init = self.parse_expr()?;
         let span = Span {
             start,
@@ -704,15 +794,15 @@ impl Parser {
             span,
             var_type: None,
             is_mutable: true,
-            init,
+            init: Some(init),
         })
     }
 
-    /// Parse an assignment statement: `name = expr`
+    /// Parse an assignment statement: `name (=|为) expr`
     fn parse_assign_stmt(&mut self) -> Result<AssignStmt, String> {
         let start = self.current_span.start;
         let (name, name_span) = self.expect_ident_span()?;
-        self.expect(&Token::Equals)?;
+        self.expect_assignment_operator()?;
         let value = self.parse_expr()?;
         let span = Span {
             start,
@@ -731,7 +821,12 @@ impl Parser {
         self.expect(&Token::ReturnKw)?;
         let value = if matches!(
             self.current,
-            Token::ScopeEnd | Token::ElseIf | Token::Else | Token::Eof
+            Token::ScopeEnd
+                | Token::ElseIf
+                | Token::Else
+                | Token::Case
+                | Token::Otherwise
+                | Token::Eof
         ) {
             None
         } else {
@@ -934,11 +1029,16 @@ impl Parser {
                         }
                     }
                     self.expect(&Token::RParen)?;
-                    Ok(Expr::Call { target: name, args })
+                    Ok(Expr::Call {
+                        target: name,
+                        type_arg: None,
+                        args,
+                    })
                 } else {
                     Ok(Expr::Ident(name))
                 }
             }
+            Token::TakeValue => self.parse_take_value_expr(),
             Token::LParen => {
                 self.advance();
                 let expr = self.parse_expr()?;
@@ -951,6 +1051,46 @@ impl Parser {
                 "表达式可以是整数、字符串、变量名、方法调用、括号表达式或一元/二元运算。",
             )),
         }
+    }
+
+    fn parse_take_value_expr(&mut self) -> Result<Expr, String> {
+        self.expect(&Token::TakeValue)?;
+        let target = self.expect_ident()?;
+        self.expect(&Token::Arrow)?;
+        let type_arg = self.parse_type()?;
+        self.expect(&Token::Colon)?;
+
+        let mut args = Vec::new();
+        if matches!(
+            self.current,
+            Token::ScopeEnd
+                | Token::ElseIf
+                | Token::Else
+                | Token::Case
+                | Token::Otherwise
+                | Token::Eof
+        ) {
+            return Ok(Expr::Call {
+                target,
+                type_arg: Some(type_arg),
+                args,
+            });
+        }
+
+        loop {
+            args.push(self.parse_expr()?);
+            if self.current == Token::Comma {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+
+        Ok(Expr::Call {
+            target,
+            type_arg: Some(type_arg),
+            args,
+        })
     }
 }
 
@@ -967,6 +1107,10 @@ fn token_name(token: &Token) -> String {
         Token::If => "判断".to_string(),
         Token::ElseIf => "若".to_string(),
         Token::Else => "否则".to_string(),
+        Token::Current => "当前".to_string(),
+        Token::Case => "取".to_string(),
+        Token::TakeValue => "取值".to_string(),
+        Token::Otherwise => "此外".to_string(),
         Token::Loop => "循环".to_string(),
         Token::Count => "计数".to_string(),
         Token::Condition => "条件".to_string(),
@@ -1006,6 +1150,7 @@ fn token_name(token: &Token) -> String {
         Token::AndAnd => "&&".to_string(),
         Token::OrOr => "||".to_string(),
         Token::Bang => "!".to_string(),
+        Token::Arrow => "->".to_string(),
         Token::Ident(name) => format!("标识符 `{}`", name),
         Token::IntLiteral(value) => format!("整数 `{}`", value),
         Token::StringLiteral(_) => "字符串字面量".to_string(),
@@ -1205,7 +1350,7 @@ mod tests {
                 assert_eq!(v.name, "x");
                 assert_eq!(v.var_type, None);
                 assert!(!v.is_mutable);
-                assert_eq!(v.init, Expr::IntLiteral(10));
+                assert_eq!(v.init, Some(Expr::IntLiteral(10)));
             }
             other => panic!("Expected VarDecl, found {:?}", other),
         }
@@ -1225,7 +1370,7 @@ mod tests {
                 assert_eq!(v.name, "y");
                 assert_eq!(v.var_type, Some(Type::Int));
                 assert!(!v.is_mutable);
-                assert_eq!(v.init, Expr::IntLiteral(20));
+                assert_eq!(v.init, Some(Expr::IntLiteral(20)));
             }
             other => panic!("Expected VarDecl, found {:?}", other),
         }
@@ -1245,7 +1390,7 @@ mod tests {
                 assert_eq!(v.name, "z");
                 assert_eq!(v.var_type, None);
                 assert!(v.is_mutable);
-                assert_eq!(v.init, Expr::IntLiteral(30));
+                assert_eq!(v.init, Some(Expr::IntLiteral(30)));
             }
             other => panic!("Expected VarDecl, found {:?}", other),
         }
@@ -1265,7 +1410,7 @@ mod tests {
                 assert_eq!(v.name, "x");
                 assert_eq!(v.var_type, None);
                 assert!(!v.is_mutable);
-                assert_eq!(v.init, Expr::IntLiteral(10));
+                assert_eq!(v.init, Some(Expr::IntLiteral(10)));
             }
             other => panic!("Expected VarDecl, found {:?}", other),
         }
@@ -1284,10 +1429,32 @@ mod tests {
             Stmt::VarDecl(v) => {
                 assert_eq!(v.name, "cnt");
                 assert!(v.is_mutable);
-                assert_eq!(v.init, Expr::IntLiteral(0));
+                assert_eq!(v.init, Some(Expr::IntLiteral(0)));
             }
             other => panic!("Expected VarDecl, found {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_predefined_var_decl_without_initializer() {
+        let source = "定义 方法 测试（）返回 无：定义变量：整数x x=10 x=11。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        assert_eq!(func.body.len(), 3);
+        match &func.body[0] {
+            Stmt::VarDecl(v) => {
+                assert_eq!(v.name, "x");
+                assert_eq!(v.var_type, Some(Type::Int));
+                assert!(v.is_mutable);
+                assert_eq!(v.init, None);
+            }
+            other => panic!("Expected VarDecl, found {:?}", other),
+        }
+        assert!(matches!(&func.body[1], Stmt::Assign(_)));
+        assert!(matches!(&func.body[2], Stmt::Assign(_)));
     }
 
     #[test]
@@ -1374,6 +1541,35 @@ mod tests {
                 assert_eq!(if_stmt.branches[1].body.len(), 1);
             }
             other => panic!("Expected If, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_with_int_and_string_cases() {
+        let source = "定义 方法 测试（）返回 无：设 x=1 当前x：取1：执行输出：“一”取 2：执行输出：“二”此外：执行输出：“其他”。。设 名字=\"问源\" 当前 名字：取“问源”：执行输出：“是”此外：执行输出：“否”。。。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[1] {
+            Stmt::Select(select_stmt) => {
+                assert_eq!(select_stmt.target, "x");
+                assert_eq!(select_stmt.cases.len(), 2);
+                assert_eq!(select_stmt.cases[0].value, Expr::IntLiteral(1));
+                assert!(select_stmt.default_body.is_some());
+            }
+            other => panic!("Expected Select, found {:?}", other),
+        }
+        match &func.body[3] {
+            Stmt::Select(select_stmt) => {
+                assert_eq!(select_stmt.target, "名字");
+                assert_eq!(
+                    select_stmt.cases[0].value,
+                    Expr::StringLiteral("问源".to_string())
+                );
+            }
+            other => panic!("Expected Select, found {:?}", other),
         }
     }
 
@@ -1493,13 +1689,87 @@ mod tests {
                 assert_eq!(var.name, "s");
                 assert_eq!(
                     var.init,
-                    Expr::Call {
+                    Some(Expr::Call {
                         target: "从零求和".to_string(),
+                        type_arg: None,
                         args: vec![Expr::IntLiteral(10)],
-                    }
+                    })
                 );
             }
             other => panic!("Expected VarDecl, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_take_value_generic_call() {
+        let source = "定义 方法 测试（）返回 无：设 s = 取值 获取输入->整数：“输入提示词”。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[0] {
+            Stmt::VarDecl(var) => {
+                assert_eq!(var.name, "s");
+                assert_eq!(
+                    var.init,
+                    Some(Expr::Call {
+                        target: "获取输入".to_string(),
+                        type_arg: Some(Type::Int),
+                        args: vec![Expr::StringLiteral("输入提示词".to_string())],
+                    })
+                );
+            }
+            other => panic!("Expected VarDecl, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_let_with_chinese_assignment_operator() {
+        let source =
+            "定义 方法 测试（）返回 无：设输入内容为取值 获取输入->整数：“请输入一个数”。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[0] {
+            Stmt::VarDecl(var) => {
+                assert_eq!(var.name, "输入内容");
+                assert_eq!(
+                    var.init,
+                    Some(Expr::Call {
+                        target: "获取输入".to_string(),
+                        type_arg: Some(Type::Int),
+                        args: vec![Expr::StringLiteral("请输入一个数".to_string())],
+                    })
+                );
+            }
+            other => panic!("Expected VarDecl, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_assignment_with_chinese_assignment_operator() {
+        let source = "定义 方法 测试（）返回 无：设 cnt = 0 cnt为cnt+1。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[1] {
+            Stmt::Assign(assign) => {
+                assert_eq!(assign.name, "cnt");
+                assert_eq!(
+                    assign.value,
+                    Expr::Binary {
+                        left: Box::new(Expr::Ident("cnt".to_string())),
+                        op: BinaryOp::Add,
+                        right: Box::new(Expr::IntLiteral(1)),
+                    }
+                );
+            }
+            other => panic!("Expected Assign, found {:?}", other),
         }
     }
 

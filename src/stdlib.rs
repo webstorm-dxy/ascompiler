@@ -2,6 +2,7 @@ use crate::lexer::Lexer;
 use crate::parser::{Parser, Program};
 
 pub const STD_IO_OUTPUT_PATH: &str = "标准库-输入输出-输出";
+pub const STD_IO_INPUT_PATH: &str = "标准库-输入输出-获取输入";
 
 const STANDARD_LIBRARY_SOURCES: &[&str] = &[include_str!("../std/输入输出.as")];
 
@@ -25,6 +26,7 @@ pub fn merge_with_standard_library(mut program: Program) -> Result<Program, Stri
 pub fn external_symbol_for(path: &str) -> Option<String> {
     match path {
         STD_IO_OUTPUT_PATH => Some("as_std_io_output".to_string()),
+        STD_IO_INPUT_PATH => Some("as_std_io_input_int".to_string()),
         _ => None,
     }
 }
@@ -67,6 +69,12 @@ mod tests {
                 .functions
                 .iter()
                 .any(|f| semantic::function_path(f) == STD_IO_OUTPUT_PATH && f.is_external)
+        );
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|f| semantic::function_path(f) == STD_IO_INPUT_PATH && f.is_external)
         );
     }
 }
