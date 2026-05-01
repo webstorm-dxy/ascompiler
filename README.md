@@ -12,6 +12,7 @@
 - 链接 `runtime/std_io.c`，提供基础输入输出运行时。
 - 支持通过 FFI 调用 Rust 编写的 `staticlib` 或 `cdylib`。
 - 可输出 LLVM IR，便于调试代码生成结果。
+- 提供独立的 Salt 包管理器，用于创建、构建和运行问源项目。
 
 ## 目录结构
 
@@ -27,6 +28,9 @@ ascompiler/
     semantic.rs   模块、导入和可调用对象的语义检查
     codegen.rs    LLVM IR 代码生成
     stdlib.rs     标准库合并逻辑
+salt/
+  Cargo.toml    Salt 包管理器 crate，生成 salt 命令
+  src/main.rs   项目创建、配置解析、构建和运行入口
 wenyuan-ffi/
   src/          Rust FFI 辅助类型和导出宏
 wenyuan-ffi-macros/
@@ -36,7 +40,8 @@ runtime/
 std/
   输入输出.as   问源标准库源码
 demo/
-  *.as          示例程序
+  *.as          单文件示例程序
+  asproj/       Salt 项目示例
 examples/
   rust-ffi      可被问源调用的 Rust FFI 示例库
 ```
@@ -77,6 +82,7 @@ cargo build
 
 ```bash
 target/debug/asc
+target/debug/salt
 ```
 
 如果要构建发布版本：
@@ -89,6 +95,7 @@ cargo build --release
 
 ```bash
 target/release/asc
+target/release/salt
 ```
 
 ### Intel Mac
@@ -259,6 +266,88 @@ cargo run -- demo/condition.as -o /tmp/wenyuan_condition
 /tmp/wenyuan_condition
 ```
 
+## Salt 包管理器
+
+Salt 是一个独立 crate，提供 `salt` 可执行文件。它复用 `ascompiler` 的编译
+流程，但面向项目目录工作。
+
+构建 Salt：
+
+```bash
+cargo build -p salt
+```
+
+创建新的可执行问源项目：
+
+```bash
+mkdir -p /tmp/wenyuan-salt-demo
+cd /tmp/wenyuan-salt-demo
+/path/to/ascompiler/target/debug/salt new hello
+cd hello
+/path/to/ascompiler/target/debug/salt build
+/path/to/ascompiler/target/debug/salt run
+```
+
+也可以在当前目录初始化项目：
+
+```bash
+/path/to/ascompiler/target/debug/salt init --bin
+```
+
+Salt 项目默认结构：
+
+```text
+project.ascfg
+src/
+  main.as
+target/
+  <exe文件名>
+```
+
+如果配置中启用系统级中文路径，Salt 会改用：
+
+```text
+项目设置
+源码/
+目标输出/
+```
+
+配置文件示例：
+
+```ascfg
+包配置：
+项目名 = “示例项目”
+版本 = “2026.4.1”
+许可证 = “MIT”
+启用系统级中文路径 = 否
+
+可执行文件设置：
+exe文件名 = “demo”
+
+Rust依赖：
+    外部依赖测试：
+        项目路径=“./examples/rust-ffi”
+```
+
+常用命令：
+
+```bash
+salt new <项目名>
+salt init --bin
+salt build
+salt run
+```
+
+`salt build` 会读取 `project.ascfg` 或 `项目设置`，收集源码目录下的 `.as`
+文件，构建配置中的 Rust 依赖，并把可执行文件写入 `target` 或 `目标输出`。
+
+仓库内的项目示例位于 `demo/asproj`：
+
+```bash
+cd demo/asproj
+../../target/debug/salt run
+```
+
 入口函数需要使用 `@声明 入口` 标记，例如：
 
 ```text
@@ -397,7 +486,9 @@ cargo fmt
 cargo test --workspace
 cargo build
 cargo build --release
+cargo build -p salt
 cargo run -- demo/condition.as --ir
+cargo run -p salt -- --help
 ```
 
 ## 常见问题
