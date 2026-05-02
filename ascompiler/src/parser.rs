@@ -1203,13 +1203,17 @@ impl Parser {
     fn parse_take_value_expr(&mut self) -> Result<Expr, String> {
         self.expect(&Token::TakeValue)?;
         let target = self.expect_ident()?;
-        self.expect(&Token::Arrow)?;
-        let type_arg = self.parse_type()?;
+        let type_arg = if self.current == Token::Arrow {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
 
         if self.current != Token::Colon {
             return Ok(Expr::Call {
                 target,
-                type_arg: Some(type_arg),
+                type_arg,
                 args: Vec::new(),
             });
         }
@@ -1228,7 +1232,7 @@ impl Parser {
         ) {
             return Ok(Expr::Call {
                 target,
-                type_arg: Some(type_arg),
+                type_arg,
                 args,
             });
         }
@@ -1244,7 +1248,7 @@ impl Parser {
 
         Ok(Expr::Call {
             target,
-            type_arg: Some(type_arg),
+            type_arg,
             args,
         })
     }
@@ -2006,6 +2010,30 @@ mod tests {
                         target: "获取输入".to_string(),
                         type_arg: Some(Type::Int),
                         args: vec![],
+                    })
+                );
+            }
+            other => panic!("Expected VarDecl, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_take_value_call_without_generic_type() {
+        let source = "定义 方法 fib（项数：整数）返回 整数：判断项数<=1：返回 项数 否则：返回 fib（项数-1）+fib（项数-2）。。。。定义 方法 测试（）返回 无：设 结果为取值fib：10。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[1];
+        match &func.body[0] {
+            Stmt::VarDecl(var) => {
+                assert_eq!(var.name, "结果");
+                assert_eq!(
+                    var.init,
+                    Some(Expr::Call {
+                        target: "fib".to_string(),
+                        type_arg: None,
+                        args: vec![Expr::IntLiteral(10)],
                     })
                 );
             }

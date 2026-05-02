@@ -1232,6 +1232,16 @@ mod tests {
     }
 
     #[test]
+    fn test_take_value_call_without_generic_type_uses_return_type() {
+        let source = "定义 方法 fib（项数：整数）返回 整数：判断项数<=1：返回 项数 否则：返回 fib（项数-1）+fib（项数-2）。。。。定义 方法 测试（）返回 无：设 结果为取值fib：10。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
     fn test_take_value_input_int_uses_std_return_type() {
         let source = "引用 模块：标准库-输入输出-获取输入 为 获取输入\n定义 方法 测试（）返回 无：设 s = 取值 获取输入->整数。。";
         let program = Parser::new(Lexer::new(source))
