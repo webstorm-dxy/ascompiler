@@ -1133,6 +1133,19 @@ fn validate_expr(
             match op {
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
                     if left_ty == Type::Int && right_ty == Type::Int {
+                        if matches!(op, BinaryOp::Div | BinaryOp::Rem) {
+                            if let Expr::IntLiteral(0) = right.as_ref() {
+                                let op_name = if matches!(op, BinaryOp::Div) {
+                                    "除法"
+                                } else {
+                                    "取余"
+                                };
+                                return Err(format!(
+                                    "编译错误: 整数{}运算中除数为零\n  = 帮助: 除数不能为零。",
+                                    op_name
+                                ));
+                            }
+                        }
                         Ok(Type::Int)
                     } else if left_ty == Type::Double && right_ty == Type::Double {
                         Ok(Type::Double)
