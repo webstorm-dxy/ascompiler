@@ -16,7 +16,9 @@ pub enum Token {
     Method,    // 方法
     Module,    // 模块
     StructKw,  // 结构
+    ObjectKw,  // 对象
     Construct, // 构造
+    Create,    // 创建
 
     // Control flow
     ReturnKw,  // 返回
@@ -211,7 +213,9 @@ impl Lexer {
                     ['方', '法'] => Some(Token::Method),
                     ['模', '块'] => Some(Token::Module),
                     ['结', '构'] => Some(Token::StructKw),
+                    ['对', '象'] => Some(Token::ObjectKw),
                     ['构', '造'] => Some(Token::Construct),
+                    ['创', '建'] => Some(Token::Create),
                     ['返', '回'] => Some(Token::ReturnKw),
                     ['判', '断'] => Some(Token::If),
                     ['否', '则'] => Some(Token::Else),
@@ -251,6 +255,10 @@ impl Lexer {
             return Some(Token::VoidKw);
         }
         if ch1 == '设' {
+            self.advance();
+            return Some(Token::Let);
+        }
+        if ch1 == '令' {
             self.advance();
             return Some(Token::Let);
         }
@@ -311,7 +319,9 @@ impl Lexer {
                         | ['方', '法']
                         | ['模', '块']
                         | ['结', '构']
+                        | ['对', '象']
                         | ['构', '造']
+                        | ['创', '建']
                         | ['返', '回']
                         | ['判', '断']
                         | ['否', '则']
@@ -342,6 +352,7 @@ impl Lexer {
         // Check 1-char keyword
         ch1 == '无'
             || ch1 == '设'
+            || ch1 == '令'
             || ch1 == '为'
             || ch1 == '若'
             || ch1 == '取'
@@ -710,6 +721,52 @@ mod tests {
             Token::Colon,
             Token::DoubleKw,
             Token::ScopeEnd,
+            Token::Eof,
+        ];
+
+        for exp in expected {
+            let tok = lexer.next_token();
+            assert_eq!(tok, exp, "Token mismatch");
+        }
+    }
+
+    #[test]
+    fn test_object_definition_and_create_tokens() {
+        let source = "定义对象向量：结构：x：小数 构造方法（x：小数）：令当前->x=x 公共成员：。。创建向量（1.0）";
+        let mut lexer = Lexer::new(source);
+
+        let expected = vec![
+            Token::Define,
+            Token::ObjectKw,
+            Token::Ident("向量".to_string()),
+            Token::Colon,
+            Token::StructKw,
+            Token::Colon,
+            Token::Ident("x".to_string()),
+            Token::Colon,
+            Token::DoubleKw,
+            Token::Construct,
+            Token::Method,
+            Token::LParen,
+            Token::Ident("x".to_string()),
+            Token::Colon,
+            Token::DoubleKw,
+            Token::RParen,
+            Token::Colon,
+            Token::Let,
+            Token::Current,
+            Token::Arrow,
+            Token::Ident("x".to_string()),
+            Token::Equals,
+            Token::Ident("x".to_string()),
+            Token::Ident("公共成员".to_string()),
+            Token::Colon,
+            Token::ScopeEnd,
+            Token::Create,
+            Token::Ident("向量".to_string()),
+            Token::LParen,
+            Token::DoubleLiteral(1.0),
+            Token::RParen,
             Token::Eof,
         ];
 

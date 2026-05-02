@@ -14,6 +14,7 @@ pub struct Program {
     pub modules: Vec<ModuleDef>,
     pub imports: Vec<ImportDecl>,
     pub structs: Vec<StructDef>,
+    pub objects: Vec<ObjectDef>,
     pub functions: Vec<FunctionDef>,
 }
 
@@ -41,6 +42,32 @@ pub struct StructField {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ObjectDef {
+    pub name: String,
+    pub fields: Vec<StructField>,
+    pub constructor: Option<ConstructorDef>,
+    pub methods: Vec<ObjectMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstructorDef {
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectMethod {
+    pub access: MemberAccess,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberAccess {
+    Public,
+    Private,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FunctionDef {
     /// Original function name from source.
     pub name: String,
@@ -65,6 +92,7 @@ pub enum Stmt {
     VarDecl(VarDecl),
     Assign(AssignStmt),
     ArrayAssign(ArrayAssignStmt),
+    FieldAssign(FieldAssignStmt),
     Return(ReturnStmt),
     Import(ImportDecl),
     Execute(ExecuteStmt),
@@ -86,6 +114,14 @@ pub struct ArrayAssignStmt {
     pub name: String,
     pub name_span: Span,
     pub index: Expr,
+    pub span: Span,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldAssignStmt {
+    pub base: Expr,
+    pub field: String,
     pub span: Span,
     pub value: Expr,
 }
@@ -172,6 +208,10 @@ pub enum Expr {
         name: String,
         fields: Vec<(String, Expr)>,
     },
+    ObjectCreate {
+        name: String,
+        args: Vec<Expr>,
+    },
     Ident(String),
     Index {
         array: Box<Expr>,
@@ -180,6 +220,11 @@ pub enum Expr {
     FieldAccess {
         base: Box<Expr>,
         field: String,
+    },
+    MethodCall {
+        receiver: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
     },
     Call {
         target: String,
@@ -382,6 +427,11 @@ impl Parser {
                 self.advance();
                 Ok((name, span))
             }
+            Token::Current => {
+                let span = self.current_span;
+                self.advance();
+                Ok(("当前".to_string(), span))
+            }
             Token::Error(message) => Err(self.lexical_error(message)),
             other => Err(self.error(
                 format!("期望标识符，但找到了 `{}`", token_name(other)),
@@ -395,6 +445,7 @@ impl Parser {
         let mut modules = Vec::new();
         let mut imports = Vec::new();
         let mut structs = Vec::new();
+        let mut objects = Vec::new();
         let mut functions = Vec::new();
 
         while self.current != Token::Eof {
@@ -420,6 +471,12 @@ impl Parser {
                         Token::StructKw => {
                             let struct_def = self.parse_struct_def_after_define()?;
                             structs.push(struct_def);
+                        }
+                        Token::ObjectKw => {
+                            let (object_def, mut object_functions) =
+                                self.parse_object_def_after_define()?;
+                            functions.append(&mut object_functions);
+                            objects.push(object_def);
                         }
                         Token::Error(message) => return Err(self.lexical_error(message)),
                         other => {
@@ -447,6 +504,7 @@ impl Parser {
             modules,
             imports,
             structs,
+            objects,
             functions,
         })
     }
@@ -618,6 +676,172 @@ impl Parser {
         Ok(StructDef { name, fields })
     }
 
+    fn parse_object_def_after_define(&mut self) -> Result<(ObjectDef, Vec<FunctionDef>), String> {
+        self.expect(&Token::ObjectKw)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::Colon)?;
+
+        let mut fields = Vec::new();
+        let mut constructor = None;
+        let mut methods = Vec::new();
+        let mut functions = Vec::new();
+
+        while self.current != Token::ScopeEnd && self.current != Token::Eof {
+            match &self.current {
+                Token::StructKw => {
+                    self.advance();
+                    self.expect(&Token::Colon)?;
+                    fields = self.parse_object_fields()?;
+                }
+                Token::Construct => {
+                    if constructor.is_some() {
+                        return Err(self.error(
+                            format!("对象 `{}` 只能定义一个构造方法", name),
+                            "请保留一个 `构造方法（...）：...。。`。",
+                        ));
+                    }
+                    constructor = Some(self.parse_constructor_def()?);
+                }
+                Token::Ident(section) if section == "公共成员" => {
+                    self.advance();
+                    self.expect(&Token::Colon)?;
+                    self.parse_object_member_section(
+                        &name,
+                        MemberAccess::Public,
+                        &mut methods,
+                        &mut functions,
+                    )?;
+                }
+                Token::Ident(section) if section == "私有成员" => {
+                    self.advance();
+                    self.expect(&Token::Colon)?;
+                    self.parse_object_member_section(
+                        &name,
+                        MemberAccess::Private,
+                        &mut methods,
+                        &mut functions,
+                    )?;
+                }
+                Token::Error(message) => return Err(self.lexical_error(message)),
+                other => {
+                    return Err(self.error(
+                        format!("对象定义中不允许出现 `{}`", token_name(other)),
+                        "对象定义可以包含 `结构：`、`构造方法（...）：`、`公共成员：` 或 `私有成员：`。",
+                    ));
+                }
+            }
+        }
+
+        self.expect(&Token::ScopeEnd)?;
+        Ok((
+            ObjectDef {
+                name,
+                fields,
+                constructor,
+                methods,
+            },
+            functions,
+        ))
+    }
+
+    fn parse_object_fields(&mut self) -> Result<Vec<StructField>, String> {
+        let mut fields = Vec::new();
+        while !self.is_object_section_boundary() {
+            let field_name = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let field_type = self.parse_type()?;
+            fields.push(StructField {
+                name: field_name,
+                field_type,
+            });
+            if self.current == Token::Comma {
+                self.advance();
+            }
+        }
+        Ok(fields)
+    }
+
+    fn parse_constructor_def(&mut self) -> Result<ConstructorDef, String> {
+        self.expect(&Token::Construct)?;
+        self.expect(&Token::Method)?;
+        self.expect(&Token::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(&Token::RParen)?;
+        self.expect(&Token::Colon)?;
+        let body = self.parse_statements_until_object_boundary()?;
+        if self.current == Token::ScopeEnd {
+            self.advance();
+        }
+        Ok(ConstructorDef { params, body })
+    }
+
+    fn parse_statements_until_object_boundary(&mut self) -> Result<Vec<Stmt>, String> {
+        let mut stmts = Vec::new();
+        while !self.is_object_section_boundary() {
+            stmts.push(self.parse_stmt()?);
+        }
+        Ok(stmts)
+    }
+
+    fn parse_object_member_section(
+        &mut self,
+        object_name: &str,
+        access: MemberAccess,
+        methods: &mut Vec<ObjectMethod>,
+        functions: &mut Vec<FunctionDef>,
+    ) -> Result<(), String> {
+        while !self.is_object_section_boundary() {
+            self.expect(&Token::Define)?;
+            let function = self.parse_object_method_after_define(object_name)?;
+            methods.push(ObjectMethod {
+                access,
+                function: function.clone(),
+            });
+            functions.push(function);
+        }
+        Ok(())
+    }
+
+    fn parse_object_method_after_define(
+        &mut self,
+        object_name: &str,
+    ) -> Result<FunctionDef, String> {
+        self.expect(&Token::Method)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::LParen)?;
+        let mut params = vec![Param {
+            name: "当前".to_string(),
+            param_type: Type::Struct(object_name.to_string()),
+        }];
+        params.extend(self.parse_params()?);
+        self.expect(&Token::RParen)?;
+        self.expect(&Token::ReturnKw)?;
+        let return_type = self.parse_type()?;
+        self.expect(&Token::Colon)?;
+        let body = self.parse_body()?;
+
+        Ok(FunctionDef {
+            name,
+            module_path: Some(object_module_path(object_name)),
+            params,
+            return_type,
+            is_entry: false,
+            is_external: false,
+            external_symbol: None,
+            body,
+        })
+    }
+
+    fn is_object_section_boundary(&self) -> bool {
+        matches!(
+            self.current,
+            Token::StructKw | Token::Construct | Token::ScopeEnd | Token::Eof
+        ) || matches!(
+            &self.current,
+            Token::Ident(section) if section == "公共成员" || section == "私有成员"
+        )
+    }
+
     /// Parse comma-separated parameters: param (, param)*
     fn parse_params(&mut self) -> Result<Vec<Param>, String> {
         let mut params = Vec::new();
@@ -720,7 +944,7 @@ impl Parser {
             Token::Define => self.parse_var_decl().map(Stmt::VarDecl),
             Token::Let => self.parse_let_stmt(),
             Token::ReturnKw => self.parse_return_stmt().map(Stmt::Return),
-            Token::Ident(_) => self.parse_assign_stmt().map(Stmt::Assign),
+            Token::Ident(_) => self.parse_assign_like_stmt(),
             Token::Import => self.parse_import_decl().map(Stmt::Import),
             Token::Execute => self.parse_execute_stmt().map(Stmt::Execute),
             Token::If => self.parse_if_stmt().map(Stmt::If),
@@ -945,6 +1169,22 @@ impl Parser {
         let start = self.current_span.start;
         self.expect(&Token::Let)?;
         let (name, name_span) = self.expect_ident_span()?;
+        if self.current == Token::Arrow {
+            self.advance();
+            let field = self.expect_ident()?;
+            self.expect_assignment_operator()?;
+            let value = self.parse_expr()?;
+            let span = Span {
+                start,
+                end: self.current_span.start.max(name_span.end),
+            };
+            return Ok(Stmt::FieldAssign(FieldAssignStmt {
+                base: Expr::Ident(name),
+                field,
+                span,
+                value,
+            }));
+        }
         if self.current == Token::LBracket {
             self.advance();
             let index = self.parse_expr()?;
@@ -980,22 +1220,38 @@ impl Parser {
         }))
     }
 
-    /// Parse an assignment statement: `name (=|为) expr`
-    fn parse_assign_stmt(&mut self) -> Result<AssignStmt, String> {
+    /// Parse an assignment statement: `name (=|为) expr` or `name->field (=|为) expr`.
+    fn parse_assign_like_stmt(&mut self) -> Result<Stmt, String> {
         let start = self.current_span.start;
         let (name, name_span) = self.expect_ident_span()?;
+        if self.current == Token::Arrow {
+            self.advance();
+            let field = self.expect_ident()?;
+            self.expect_assignment_operator()?;
+            let value = self.parse_expr()?;
+            let span = Span {
+                start,
+                end: self.current_span.start.max(name_span.end),
+            };
+            return Ok(Stmt::FieldAssign(FieldAssignStmt {
+                base: Expr::Ident(name),
+                field,
+                span,
+                value,
+            }));
+        }
         self.expect_assignment_operator()?;
         let value = self.parse_expr()?;
         let span = Span {
             start,
             end: self.current_span.start.max(name_span.end),
         };
-        Ok(AssignStmt {
+        Ok(Stmt::Assign(AssignStmt {
             name,
             name_span,
             span,
             value,
-        })
+        }))
     }
 
     /// Parse `返回` or `返回 expr`.
@@ -1195,10 +1451,20 @@ impl Parser {
                     };
                     let field = field.clone();
                     self.advance();
-                    expr = Expr::FieldAccess {
-                        base: Box::new(expr),
-                        field,
-                    };
+                    if self.current == Token::LParen {
+                        self.advance();
+                        let args = self.parse_call_args()?;
+                        expr = Expr::MethodCall {
+                            receiver: Box::new(expr),
+                            method: field,
+                            args,
+                        };
+                    } else {
+                        expr = Expr::FieldAccess {
+                            base: Box::new(expr),
+                            field,
+                        };
+                    }
                 }
                 _ => break,
             }
@@ -1242,29 +1508,29 @@ impl Parser {
                 let expr = self.parse_struct_literal()?;
                 Ok((expr, self.current_span.start))
             }
+            Token::Create => {
+                let expr = self.parse_object_create()?;
+                Ok((expr, self.current_span.start))
+            }
+            Token::Current => {
+                self.advance();
+                Ok((Expr::Ident("当前".to_string()), start_span.end))
+            }
             Token::Ident(name) => {
                 let name = name.clone();
                 self.advance();
                 if self.current == Token::LParen {
                     self.advance();
-                    let mut args = Vec::new();
-                    if self.current != Token::RParen {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if self.current == Token::Comma {
-                                self.advance();
-                                continue;
-                            }
-                            break;
-                        }
-                    }
+                    let args = self.parse_call_args()?;
                     let end = self.current_span.end;
-                    self.expect(&Token::RParen)?;
-                    Ok((Expr::Call {
-                        target: name,
-                        type_arg: None,
-                        args,
-                    }, end))
+                    Ok((
+                        Expr::Call {
+                            target: name,
+                            type_arg: None,
+                            args,
+                        },
+                        end,
+                    ))
                 } else {
                     Ok((Expr::Ident(name), start_span.end))
                 }
@@ -1286,6 +1552,22 @@ impl Parser {
                 "表达式可以是整数、字符串、数组字面量、变量名、方法调用、括号表达式或一元/二元运算。",
             )),
         }
+    }
+
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>, String> {
+        let mut args = Vec::new();
+        if self.current != Token::RParen {
+            loop {
+                args.push(self.parse_expr()?);
+                if self.current == Token::Comma {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(args)
     }
 
     fn parse_array_literal(&mut self) -> Result<Expr, String> {
@@ -1323,6 +1605,14 @@ impl Parser {
 
         self.expect(&Token::ScopeEnd)?;
         Ok(Expr::StructLiteral { name, fields })
+    }
+
+    fn parse_object_create(&mut self) -> Result<Expr, String> {
+        self.expect(&Token::Create)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::LParen)?;
+        let args = self.parse_call_args()?;
+        Ok(Expr::ObjectCreate { name, args })
     }
 
     fn parse_take_value_expr(&mut self) -> Result<Expr, String> {
@@ -1389,7 +1679,9 @@ fn token_name(token: &Token) -> String {
         Token::Method => "方法".to_string(),
         Token::Module => "模块".to_string(),
         Token::StructKw => "结构".to_string(),
+        Token::ObjectKw => "对象".to_string(),
         Token::Construct => "构造".to_string(),
+        Token::Create => "创建".to_string(),
         Token::ReturnKw => "返回".to_string(),
         Token::If => "判断".to_string(),
         Token::ElseIf => "若".to_string(),
@@ -1449,6 +1741,10 @@ fn token_name(token: &Token) -> String {
         Token::Error(message) => format!("错误 token（{}）", message),
         Token::Eof => "文件结束".to_string(),
     }
+}
+
+pub fn object_module_path(object_name: &str) -> String {
+    format!("对象-{}", object_name)
 }
 
 fn render_diagnostic(
@@ -1958,6 +2254,52 @@ mod tests {
                 ])]
             ),
             other => panic!("Expected Execute, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_object_definition_create_and_method_call() {
+        let source = "定义对象向量：结构：x：小数，y：小数 构造方法（x：小数，y：小数）：令当前->x=x 令当前->y=y 公共成员：定义方法相乘（另一个向量：向量）返回 小数：返回 当前->x*另一个向量->x+当前->y*另一个向量->y。。。。定义 方法 测试（）返回 无：设 向量1=创建向量（10.0，15.0）设 向量2=创建向量（10.0，10.0）设 结果=向量1->相乘（向量2）。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        assert_eq!(program.objects.len(), 1);
+        assert_eq!(program.objects[0].name, "向量");
+        assert_eq!(program.objects[0].fields.len(), 2);
+        assert_eq!(
+            program.objects[0]
+                .constructor
+                .as_ref()
+                .unwrap()
+                .params
+                .len(),
+            2
+        );
+        assert_eq!(program.objects[0].methods.len(), 1);
+        assert_eq!(program.functions.len(), 2);
+
+        let func = &program.functions[1];
+        match &func.body[0] {
+            Stmt::VarDecl(var) => assert_eq!(
+                var.init,
+                Some(Expr::ObjectCreate {
+                    name: "向量".to_string(),
+                    args: vec![Expr::DoubleLiteral(10.0), Expr::DoubleLiteral(15.0)],
+                })
+            ),
+            other => panic!("Expected VarDecl, found {:?}", other),
+        }
+        match &func.body[2] {
+            Stmt::VarDecl(var) => assert_eq!(
+                var.init,
+                Some(Expr::MethodCall {
+                    receiver: Box::new(Expr::Ident("向量1".to_string())),
+                    method: "相乘".to_string(),
+                    args: vec![Expr::Ident("向量2".to_string())],
+                })
+            ),
+            other => panic!("Expected VarDecl, found {:?}", other),
         }
     }
 

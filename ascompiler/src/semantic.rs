@@ -1,7 +1,8 @@
 use crate::lexer::Span;
 use crate::parser::{
-    ArrayAssignStmt, AssignStmt, BinaryOp, Expr, FormatPart, FunctionDef, ImportDecl, Program,
-    ReturnStmt, Stmt, StructDef, Type, UnaryOp, VarDecl,
+    ArrayAssignStmt, AssignStmt, BinaryOp, Expr, FieldAssignStmt, FormatPart, FunctionDef,
+    ImportDecl, ObjectDef, Program, ReturnStmt, Stmt, StructDef, Type, UnaryOp, VarDecl,
+    object_module_path,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -65,7 +66,8 @@ pub fn analyze_with_source(
         validate_import(import, &registry)?;
     }
 
-    validate_structs(&program.structs)?;
+    validate_structs(&program.structs, &program.objects)?;
+    validate_objects(program)?;
 
     for func in &program.functions {
         for param in &func.params {
@@ -157,6 +159,9 @@ fn validate_stmt(
                 locals,
                 source_context,
             )?;
+        }
+        Stmt::FieldAssign(assign) => {
+            validate_field_assign_stmt(assign, program, func, scoped_imports, locals)?;
         }
         Stmt::Return(ret) => {
             validate_return_stmt(
@@ -513,6 +518,35 @@ fn validate_array_assign_stmt(
     }
 }
 
+fn validate_field_assign_stmt(
+    assign: &FieldAssignStmt,
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalInfo>,
+) -> Result<(), String> {
+    let base_type = validate_expr(&assign.base, program, func, scoped_imports, locals)?;
+    let Type::Struct(type_name_value) = base_type else {
+        return Err(format!(
+            "不能对 {} 类型设置字段\n  = 帮助: 字段赋值形如 `令当前->x = 1`。",
+            type_name(&base_type)
+        ));
+    };
+    ensure_object_field_access_allowed(program, func, &type_name_value, &assign.field)?;
+    let (_, field_type) = aggregate_field_info(program, &type_name_value, &assign.field)?;
+    let value_type = validate_expr(&assign.value, program, func, scoped_imports, locals)?;
+    if value_type == field_type {
+        Ok(())
+    } else {
+        Err(format!(
+            "字段 `{}` 赋值类型不匹配\n  = 字段类型: {}\n  = 表达式类型: {}",
+            assign.field,
+            type_name(&field_type),
+            type_name(&value_type)
+        ))
+    }
+}
+
 fn validate_return_stmt(
     ret: &ReturnStmt,
     expected_type: &Type,
@@ -562,11 +596,14 @@ fn validate_condition(
     }
 }
 
-fn validate_structs(structs: &[StructDef]) -> Result<(), String> {
+fn validate_structs(structs: &[StructDef], objects: &[ObjectDef]) -> Result<(), String> {
     let mut names = HashSet::new();
     for struct_def in structs {
         if !names.insert(struct_def.name.clone()) {
             return Err(format!("结构 `{}` 重复定义", struct_def.name));
+        }
+        if objects.iter().any(|object| object.name == struct_def.name) {
+            return Err(format!("类型 `{}` 同时定义为结构和对象", struct_def.name));
         }
         if struct_def.fields.is_empty() {
             return Err(format!(
@@ -586,27 +623,109 @@ fn validate_structs(structs: &[StructDef]) -> Result<(), String> {
     }
     for struct_def in structs {
         for field in &struct_def.fields {
-            validate_declared_type_in_structs(&field.field_type, structs)?;
+            validate_declared_type_in_structs(&field.field_type, structs, objects)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_objects(program: &Program) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for object in &program.objects {
+        if !names.insert(object.name.clone()) {
+            return Err(format!("对象 `{}` 重复定义", object.name));
+        }
+        if object.fields.is_empty() {
+            return Err(format!(
+                "对象 `{}` 至少需要一个结构字段\n  = 帮助: 在对象内写 `结构：字段：类型`。",
+                object.name
+            ));
+        }
+        let mut field_names = HashSet::new();
+        for field in &object.fields {
+            if !field_names.insert(field.name.clone()) {
+                return Err(format!(
+                    "对象 `{}` 中字段 `{}` 重复定义",
+                    object.name, field.name
+                ));
+            }
+            validate_declared_type(&field.field_type, program)?;
+        }
+        if let Some(constructor) = &object.constructor {
+            let mut locals: HashMap<String, LocalInfo> = constructor
+                .params
+                .iter()
+                .map(|param| {
+                    (
+                        param.name.clone(),
+                        LocalInfo {
+                            ty: param.param_type.clone(),
+                            is_mutable: false,
+                            declaration_span: None,
+                        },
+                    )
+                })
+                .collect();
+            locals.insert(
+                "当前".to_string(),
+                LocalInfo {
+                    ty: Type::Struct(object.name.clone()),
+                    is_mutable: false,
+                    declaration_span: None,
+                },
+            );
+            let constructor_func = FunctionDef {
+                name: "构造方法".to_string(),
+                module_path: Some(object_module_path(&object.name)),
+                params: constructor.params.clone(),
+                return_type: Type::Void,
+                is_entry: false,
+                is_external: false,
+                external_symbol: None,
+                body: constructor.body.clone(),
+            };
+            let registry = ModuleRegistry::from_program(program);
+            let mut scoped_imports = program.imports.clone();
+            for stmt in &constructor.body {
+                validate_stmt(
+                    stmt,
+                    program,
+                    &constructor_func,
+                    &registry,
+                    &mut scoped_imports,
+                    &mut locals,
+                    SourceContext {
+                        source: None,
+                        source_name: None,
+                    },
+                )?;
+            }
         }
     }
     Ok(())
 }
 
 fn validate_declared_type(ty: &Type, program: &Program) -> Result<(), String> {
-    validate_declared_type_in_structs(ty, &program.structs)
+    validate_declared_type_in_structs(ty, &program.structs, &program.objects)
 }
 
-fn validate_declared_type_in_structs(ty: &Type, structs: &[StructDef]) -> Result<(), String> {
+fn validate_declared_type_in_structs(
+    ty: &Type,
+    structs: &[StructDef],
+    objects: &[ObjectDef],
+) -> Result<(), String> {
     match ty {
         Type::Struct(name) => {
-            if structs.iter().any(|struct_def| struct_def.name == *name) {
+            if structs.iter().any(|struct_def| struct_def.name == *name)
+                || objects.iter().any(|object| object.name == *name)
+            {
                 Ok(())
             } else {
-                Err(format!("未定义的结构 `{}`", name))
+                Err(format!("未定义的结构或对象 `{}`", name))
             }
         }
         Type::Array { element_type, .. } => {
-            validate_declared_type_in_structs(element_type, structs)
+            validate_declared_type_in_structs(element_type, structs, objects)
         }
         _ => Ok(()),
     }
@@ -617,6 +736,71 @@ fn find_struct<'a>(program: &'a Program, name: &str) -> Option<&'a StructDef> {
         .structs
         .iter()
         .find(|struct_def| struct_def.name == name)
+}
+
+fn find_object<'a>(program: &'a Program, name: &str) -> Option<&'a ObjectDef> {
+    program.objects.iter().find(|object| object.name == name)
+}
+
+fn find_object_method<'a>(
+    program: &'a Program,
+    object_name: &str,
+    method: &str,
+) -> Option<&'a crate::parser::ObjectMethod> {
+    find_object(program, object_name)?
+        .methods
+        .iter()
+        .find(|candidate| candidate.function.name == method)
+}
+
+fn current_object_name(func: &FunctionDef) -> Option<String> {
+    func.module_path
+        .as_ref()
+        .and_then(|path| path.strip_prefix("对象-"))
+        .map(ToString::to_string)
+}
+
+fn ensure_object_field_access_allowed(
+    program: &Program,
+    func: &FunctionDef,
+    type_name_value: &str,
+    field: &str,
+) -> Result<(), String> {
+    if find_object(program, type_name_value).is_some()
+        && current_object_name(func).as_deref() != Some(type_name_value)
+    {
+        return Err(format!(
+            "对象 `{}` 的结构字段 `{}` 默认私有，不能在对象外访问",
+            type_name_value, field
+        ));
+    }
+    Ok(())
+}
+
+fn aggregate_field_info(
+    program: &Program,
+    type_name_value: &str,
+    field: &str,
+) -> Result<(usize, Type), String> {
+    if let Some(struct_def) = find_struct(program, type_name_value) {
+        return struct_def
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| candidate.name == field)
+            .map(|(index, field_def)| (index, field_def.field_type.clone()))
+            .ok_or_else(|| format!("结构 `{}` 没有字段 `{}`", type_name_value, field));
+    }
+    if let Some(object) = find_object(program, type_name_value) {
+        return object
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| candidate.name == field)
+            .map(|(index, field_def)| (index, field_def.field_type.clone()))
+            .ok_or_else(|| format!("对象 `{}` 没有字段 `{}`", type_name_value, field));
+    }
+    Err(format!("未定义的结构或对象 `{}`", type_name_value))
 }
 
 fn validate_struct_literal(
@@ -662,6 +846,48 @@ fn validate_struct_literal(
     Ok(Type::Struct(name.to_string()))
 }
 
+fn validate_object_create(
+    name: &str,
+    args: &[Expr],
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalInfo>,
+) -> Result<Type, String> {
+    let object = find_object(program, name).ok_or_else(|| {
+        format!(
+            "未定义的对象 `{}`\n  = 帮助: 请先在顶层写 `定义对象{}：...。。`。",
+            name, name
+        )
+    })?;
+    let params: &[crate::parser::Param] = object
+        .constructor
+        .as_ref()
+        .map(|constructor| constructor.params.as_slice())
+        .unwrap_or(&[]);
+    if args.len() != params.len() {
+        return Err(format!(
+            "创建 `{}` 的参数数量不匹配\n  = 期望: {} 个\n  = 实际: {} 个",
+            name,
+            params.len(),
+            args.len()
+        ));
+    }
+    for (arg, param) in args.iter().zip(params) {
+        let arg_type = validate_expr(arg, program, func, scoped_imports, locals)?;
+        if arg_type != param.param_type {
+            return Err(format!(
+                "创建 `{}` 的参数 `{}` 类型不匹配\n  = 期望: {}\n  = 实际: {}",
+                name,
+                param.name,
+                type_name(&param.param_type),
+                type_name(&arg_type)
+            ));
+        }
+    }
+    Ok(Type::Struct(name.to_string()))
+}
+
 fn validate_field_access(
     base: &Expr,
     field: &str,
@@ -677,14 +903,58 @@ fn validate_field_access(
             type_name(&base_type)
         ));
     };
-    let struct_def = find_struct(program, &struct_name)
-        .ok_or_else(|| format!("未定义的结构 `{}`", struct_name))?;
-    struct_def
-        .fields
-        .iter()
-        .find(|candidate| candidate.name == field)
-        .map(|field_def| field_def.field_type.clone())
-        .ok_or_else(|| format!("结构 `{}` 没有字段 `{}`", struct_name, field))
+    ensure_object_field_access_allowed(program, func, &struct_name, field)?;
+    aggregate_field_info(program, &struct_name, field).map(|(_, ty)| ty)
+}
+
+fn validate_method_call(
+    receiver: &Expr,
+    method: &str,
+    args: &[Expr],
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalInfo>,
+) -> Result<Type, String> {
+    let receiver_type = validate_expr(receiver, program, func, scoped_imports, locals)?;
+    let Type::Struct(object_name) = receiver_type else {
+        return Err(format!(
+            "不能对 {} 类型调用对象方法\n  = 帮助: 方法调用形如 `对象变量->方法（参数）`。",
+            type_name(&receiver_type)
+        ));
+    };
+    let method_def = find_object_method(program, &object_name, method)
+        .ok_or_else(|| format!("对象 `{}` 没有方法 `{}`", object_name, method))?;
+    if method_def.access == crate::parser::MemberAccess::Private
+        && current_object_name(func).as_deref() != Some(object_name.as_str())
+    {
+        return Err(format!(
+            "对象 `{}` 的私有方法 `{}` 不能在这里调用",
+            object_name, method
+        ));
+    }
+    let params = &method_def.function.params[1..];
+    if args.len() != params.len() {
+        return Err(format!(
+            "方法 `{}` 的参数数量不匹配\n  = 期望: {} 个\n  = 实际: {} 个",
+            method,
+            params.len(),
+            args.len()
+        ));
+    }
+    for (arg, param) in args.iter().zip(params) {
+        let arg_type = validate_expr(arg, program, func, scoped_imports, locals)?;
+        if arg_type != param.param_type {
+            return Err(format!(
+                "方法 `{}` 的参数 `{}` 类型不匹配\n  = 期望: {}\n  = 实际: {}",
+                method,
+                param.name,
+                type_name(&param.param_type),
+                type_name(&arg_type)
+            ));
+        }
+    }
+    Ok(method_def.function.return_type.clone())
 }
 
 fn validate_format_placeholder(
@@ -794,6 +1064,9 @@ fn validate_expr(
         Expr::StructLiteral { name, fields } => {
             validate_struct_literal(name, fields, program, func, scoped_imports, locals)
         }
+        Expr::ObjectCreate { name, args } => {
+            validate_object_create(name, args, program, func, scoped_imports, locals)
+        }
         Expr::Index { array, index } => {
             if !matches!(array.as_ref(), Expr::Ident(_)) {
                 return Err("当前只支持通过变量名访问数组\n  = 帮助: 请写成 `arr[n]`。".to_string());
@@ -831,6 +1104,19 @@ fn validate_expr(
         Expr::FieldAccess { base, field } => {
             validate_field_access(base, field, program, func, scoped_imports, locals)
         }
+        Expr::MethodCall {
+            receiver,
+            method,
+            args,
+        } => validate_method_call(
+            receiver,
+            method,
+            args,
+            program,
+            func,
+            scoped_imports,
+            locals,
+        ),
         Expr::Unary { op, expr } => {
             let ty = validate_expr(expr, program, func, scoped_imports, locals)?;
             match (op, ty) {
@@ -1396,6 +1682,27 @@ mod tests {
 
         let err = analyze(&program).expect_err("Semantic analysis should fail");
         assert!(err.contains("字段 `x` 类型不匹配"));
+    }
+
+    #[test]
+    fn test_object_create_and_public_method_call() {
+        let source = "定义对象向量：结构：x：小数，y：小数 构造方法（x：小数，y：小数）：令当前->x=x 令当前->y=y 公共成员：定义方法相乘（另一个向量：向量）返回 小数：返回 当前->x*另一个向量->x+当前->y*另一个向量->y。。。。定义 方法 测试（）返回 小数：设 向量1=创建向量（10.0，15.0）设 向量2=创建向量（10.0，10.0）返回 向量1->相乘（向量2）。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_object_fields_are_private_outside_object() {
+        let source = "定义对象向量：结构：x：小数 公共成员：定义方法读取x（）返回 小数：返回 当前->x。。。。定义 方法 测试（）返回 小数：设 向量1=创建向量（）返回 向量1->x。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        let err = analyze(&program).expect_err("Expected private field error");
+        assert!(err.contains("默认私有"));
     }
 
     #[test]

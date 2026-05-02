@@ -37,6 +37,7 @@ fn empty_program() -> Program {
         modules: Vec::new(),
         imports: Vec::new(),
         structs: Vec::new(),
+        objects: Vec::new(),
         functions: Vec::new(),
     }
 }
@@ -46,6 +47,7 @@ fn merge_programs(target: &mut Program, source: Program) {
     target.modules.extend(source.modules);
     target.imports.extend(source.imports);
     target.structs.extend(source.structs);
+    target.objects.extend(source.objects);
     target.functions.extend(source.functions);
 }
 
@@ -54,6 +56,7 @@ fn prepend_program(program: &mut Program, mut prefix: Program) {
     prefix.modules.append(&mut program.modules);
     prefix.imports.append(&mut program.imports);
     prefix.structs.append(&mut program.structs);
+    prefix.objects.append(&mut program.objects);
     prefix.functions.append(&mut program.functions);
     *program = prefix;
 }

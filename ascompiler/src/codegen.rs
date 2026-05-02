@@ -1,7 +1,8 @@
 /// Code generation: walks the AST and emits LLVM IR via inkwell.
 use crate::parser::{
-    ArrayAssignStmt, AssignStmt, BinaryOp, ExecuteStmt, Expr, FormatPart, FunctionDef, IfStmt,
-    ImportDecl, LoopStmt, Program, ReturnStmt, SelectStmt, Stmt, Type, UnaryOp, VarDecl,
+    ArrayAssignStmt, AssignStmt, BinaryOp, ExecuteStmt, Expr, FieldAssignStmt, FormatPart,
+    FunctionDef, IfStmt, ImportDecl, LoopStmt, Program, ReturnStmt, SelectStmt, Stmt, Type,
+    UnaryOp, VarDecl,
 };
 use crate::semantic;
 use crate::stdlib;
@@ -20,7 +21,7 @@ use std::collections::HashMap;
 
 #[derive(Clone)]
 enum LocalValue<'ctx> {
-    Pointer(PointerValue<'ctx>, Type, bool),
+    Pointer(PointerValue<'ctx>, Type, bool, bool),
 }
 
 /// Generate LLVM IR for the entire program.
@@ -53,6 +54,9 @@ fn as_llvm_type<'ctx>(
         Type::Char => Ok(context.i8_type().into()),
         Type::String => Ok(context.ptr_type(AddressSpace::from(0u16)).into()),
         Type::Struct(name) => {
+            if is_object_name(program, name) {
+                return Ok(context.ptr_type(AddressSpace::from(0u16)).into());
+            }
             let struct_def = program
                 .structs
                 .iter()
@@ -72,6 +76,58 @@ fn as_llvm_type<'ctx>(
             .array_type(length.expect("array type must have a known length") as u32)
             .into()),
     }
+}
+
+fn is_object_name(program: &Program, name: &str) -> bool {
+    program.objects.iter().any(|object| object.name == name)
+}
+
+fn find_object_method<'a>(
+    program: &'a Program,
+    object_name: &str,
+    method: &str,
+) -> Option<&'a crate::parser::ObjectMethod> {
+    program
+        .objects
+        .iter()
+        .find(|object| object.name == object_name)?
+        .methods
+        .iter()
+        .find(|candidate| candidate.function.name == method)
+}
+
+fn aggregate_fields<'a>(
+    program: &'a Program,
+    name: &str,
+) -> Result<&'a [crate::parser::StructField], String> {
+    if let Some(struct_def) = program
+        .structs
+        .iter()
+        .find(|candidate| candidate.name == name)
+    {
+        return Ok(&struct_def.fields);
+    }
+    if let Some(object) = program
+        .objects
+        .iter()
+        .find(|candidate| candidate.name == name)
+    {
+        return Ok(&object.fields);
+    }
+    Err(format!("未定义的结构或对象: {}", name))
+}
+
+fn aggregate_struct_type<'ctx>(
+    name: &str,
+    context: &'ctx Context,
+    program: &Program,
+) -> Result<inkwell::types::StructType<'ctx>, String> {
+    let fields = aggregate_fields(program, name)?;
+    let field_types = fields
+        .iter()
+        .map(|field| as_llvm_type(&field.field_type, context, program))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(context.struct_type(&field_types, false))
 }
 
 /// Sanitize a variable/function name for LLVM IR identifiers.
@@ -185,7 +241,7 @@ fn compile_function<'ctx>(
                 .map_err(|e| format!("build_store failed: {:?}", e))?;
             locals.insert(
                 param.name.clone(),
-                LocalValue::Pointer(alloca, param.param_type.clone(), false),
+                LocalValue::Pointer(alloca, param.param_type.clone(), false, false),
             );
         }
     }
@@ -216,6 +272,7 @@ fn compile_function<'ctx>(
         .and_then(|block| block.get_terminator())
         .is_none()
     {
+        free_owned_objects(&locals, program, &builder, context)?;
         // Build default return instruction
         if func.is_entry {
             let _ = builder.build_return(Some(&context.i32_type().const_int(0, false)));
@@ -295,6 +352,16 @@ fn compile_stmt<'ctx>(
             module,
         ),
         Stmt::ArrayAssign(assign) => compile_array_assign_stmt(
+            assign,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
+        Stmt::FieldAssign(assign) => compile_field_assign_stmt(
             assign,
             current_func,
             program,
@@ -403,7 +470,12 @@ fn compile_var_decl<'ctx>(
     }
     locals.insert(
         var.name.clone(),
-        LocalValue::Pointer(alloca, var_type, var.is_mutable),
+        LocalValue::Pointer(
+            alloca,
+            var_type.clone(),
+            var.is_mutable,
+            matches!(var.init, Some(Expr::ObjectCreate { .. })),
+        ),
     );
 
     Ok(())
@@ -423,7 +495,7 @@ fn compile_assign_stmt<'ctx>(
         .get(&assign.name)
         .cloned()
         .ok_or_else(|| format!("未定义的变量: {}", assign.name))?;
-    let LocalValue::Pointer(ptr, _, is_mutable) = local;
+    let LocalValue::Pointer(ptr, _, is_mutable, _) = local;
     if !is_mutable {
         return Err(format!("不可变变量不能重新赋值: {}", assign.name));
     }
@@ -486,6 +558,49 @@ fn compile_array_assign_stmt<'ctx>(
         })
 }
 
+fn compile_field_assign_stmt<'ctx>(
+    assign: &FieldAssignStmt,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(), String> {
+    let (field_ptr, field_type) = compile_field_ptr(
+        &assign.base,
+        &assign.field,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
+    let value = compile_expr(
+        &assign.value,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
+    builder
+        .build_store(field_ptr, value)
+        .map(|_| ())
+        .map_err(|e| {
+            format!(
+                "build_store field failed for {}: {:?}",
+                type_name(&field_type),
+                e
+            )
+        })
+}
+
 fn compile_return_stmt<'ctx>(
     ret: &ReturnStmt,
     current_func: &FunctionDef,
@@ -497,12 +612,14 @@ fn compile_return_stmt<'ctx>(
     module: &Module<'ctx>,
 ) -> Result<(), String> {
     if current_func.is_entry {
+        free_owned_objects(locals, program, builder, context)?;
         return builder
             .build_return(Some(&context.i32_type().const_int(0, false)))
             .map(|_| ())
             .map_err(|e| format!("build_return failed: {:?}", e));
     }
     if current_func.return_type == Type::Void {
+        free_owned_objects(locals, program, builder, context)?;
         return builder
             .build_return(None)
             .map(|_| ())
@@ -523,6 +640,7 @@ fn compile_return_stmt<'ctx>(
         context,
         module,
     )?;
+    free_owned_objects(locals, program, builder, context)?;
     builder
         .build_return(Some(&value))
         .map(|_| ())
@@ -951,7 +1069,7 @@ fn compile_count_loop<'ctx>(
     let mut loop_locals = locals.clone();
     loop_locals.insert(
         var_name.to_string(),
-        LocalValue::Pointer(counter_alloca, Type::Int, false),
+        LocalValue::Pointer(counter_alloca, Type::Int, false, false),
     );
     for stmt in body {
         compile_stmt(
@@ -1076,7 +1194,7 @@ fn compile_iterate_loop<'ctx>(
     let mut loop_locals = locals.clone();
     loop_locals.insert(
         var_name.to_string(),
-        LocalValue::Pointer(iterator_alloca, Type::Int, false),
+        LocalValue::Pointer(iterator_alloca, Type::Int, false, false),
     );
     for stmt in body {
         compile_stmt(
@@ -1256,6 +1374,17 @@ fn compile_expr<'ctx>(
             context,
             module,
         ),
+        Expr::ObjectCreate { name, args } => compile_object_create(
+            name,
+            args,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
         Expr::Index { array, index } => compile_array_index(
             array,
             index,
@@ -1270,6 +1399,22 @@ fn compile_expr<'ctx>(
         Expr::FieldAccess { base, field } => compile_field_access(
             base,
             field,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
+        Expr::MethodCall {
+            receiver,
+            method,
+            args,
+        } => compile_method_call(
+            receiver,
+            method,
+            args,
             current_func,
             program,
             scoped_imports,
@@ -1543,6 +1688,71 @@ fn compile_call_expr<'ctx>(
         .unwrap_basic())
 }
 
+fn compile_method_call<'ctx>(
+    receiver: &Expr,
+    method: &str,
+    args: &[Expr],
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, String> {
+    let receiver_type =
+        infer_type_from_expr(receiver, current_func, program, scoped_imports, locals)?;
+    let Type::Struct(object_name) = receiver_type else {
+        return Err(format!(
+            "不能对 {} 类型调用对象方法",
+            type_name(&receiver_type)
+        ));
+    };
+    let method_def = find_object_method(program, &object_name, method)
+        .ok_or_else(|| format!("对象 `{}` 没有方法 `{}`", object_name, method))?;
+    if method_def.function.return_type == Type::Void {
+        return Err(format!("方法没有返回值: {}", method));
+    }
+    let function = module
+        .get_function(&llvm_function_name(&method_def.function))
+        .ok_or_else(|| format!("未找到对象方法: {}->{}", object_name, method))?;
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.push(
+        compile_expr(
+            receiver,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        )?
+        .into(),
+    );
+    for arg in args {
+        call_args.push(
+            compile_expr(
+                arg,
+                current_func,
+                program,
+                scoped_imports,
+                locals,
+                builder,
+                context,
+                module,
+            )?
+            .into(),
+        );
+    }
+
+    Ok(builder
+        .build_call(function, &call_args, "method.call")
+        .map_err(|e| format!("build_call failed: {:?}", e))?
+        .try_as_basic_value()
+        .unwrap_basic())
+}
+
 fn compile_logical_expr<'ctx>(
     left: &Expr,
     op: &BinaryOp,
@@ -1687,6 +1897,7 @@ fn infer_type_from_expr<'ctx>(
             Ok(Type::String)
         }
         Expr::StructLiteral { name, .. } => Ok(Type::Struct(name.clone())),
+        Expr::ObjectCreate { name, .. } => Ok(Type::Struct(name.clone())),
         Expr::ArrayLiteral(elements) => {
             if elements.is_empty() {
                 return Err("数组字面量不能为空".to_string());
@@ -1724,6 +1935,21 @@ fn infer_type_from_expr<'ctx>(
         }
         Expr::FieldAccess { base, field } => {
             infer_field_type(base, field, current_func, program, scoped_imports, locals)
+        }
+        Expr::MethodCall {
+            receiver, method, ..
+        } => {
+            let receiver_type =
+                infer_type_from_expr(receiver, current_func, program, scoped_imports, locals)?;
+            let Type::Struct(object_name) = receiver_type else {
+                return Err(format!(
+                    "不能对 {} 类型调用对象方法",
+                    type_name(&receiver_type)
+                ));
+            };
+            find_object_method(program, &object_name, method)
+                .map(|method_def| method_def.function.return_type.clone())
+                .ok_or_else(|| format!("对象 `{}` 没有方法 `{}`", object_name, method))
         }
         Expr::Unary { op, expr } => match op {
             UnaryOp::Neg => {
@@ -1788,18 +2014,12 @@ fn struct_field_info(
     struct_name: &str,
     field: &str,
 ) -> Result<(usize, Type), String> {
-    let struct_def = program
-        .structs
-        .iter()
-        .find(|candidate| candidate.name == struct_name)
-        .ok_or_else(|| format!("未定义的结构: {}", struct_name))?;
-    struct_def
-        .fields
+    aggregate_fields(program, struct_name)?
         .iter()
         .enumerate()
         .find(|(_, candidate)| candidate.name == field)
         .map(|(index, field_def)| (index, field_def.field_type.clone()))
-        .ok_or_else(|| format!("结构 `{}` 没有字段 `{}`", struct_name, field))
+        .ok_or_else(|| format!("结构或对象 `{}` 没有字段 `{}`", struct_name, field))
 }
 
 fn resolve_var_type<'ctx>(
@@ -1936,6 +2156,115 @@ fn compile_struct_literal<'ctx>(
     Ok(struct_value.into())
 }
 
+fn compile_object_create<'ctx>(
+    name: &str,
+    args: &[Expr],
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, String> {
+    let object = program
+        .objects
+        .iter()
+        .find(|candidate| candidate.name == name)
+        .ok_or_else(|| format!("未定义的对象: {}", name))?;
+    let object_type = aggregate_struct_type(name, context, program)?;
+    let ptr = builder
+        .build_malloc(object_type, "object.create")
+        .map_err(|e| format!("build_malloc failed: {:?}", e))?;
+    builder
+        .build_store(ptr, object_type.const_zero())
+        .map_err(|e| format!("build_store object zero failed: {:?}", e))?;
+
+    if let Some(constructor) = &object.constructor {
+        if args.len() != constructor.params.len() {
+            return Err(format!(
+                "创建 `{}` 的参数数量不匹配: 期望 {}，实际 {}",
+                name,
+                constructor.params.len(),
+                args.len()
+            ));
+        }
+        let mut constructor_locals = locals.clone();
+        let current_alloca = builder
+            .build_alloca(
+                as_llvm_type(&Type::Struct(name.to_string()), context, program)?,
+                "current.object",
+            )
+            .map_err(|e| format!("build_alloca failed: {:?}", e))?;
+        builder
+            .build_store(current_alloca, ptr)
+            .map_err(|e| format!("build_store failed: {:?}", e))?;
+        constructor_locals.insert(
+            "当前".to_string(),
+            LocalValue::Pointer(current_alloca, Type::Struct(name.to_string()), false, false),
+        );
+
+        for (arg, param) in args.iter().zip(&constructor.params) {
+            let value = compile_expr(
+                arg,
+                current_func,
+                program,
+                scoped_imports,
+                locals,
+                builder,
+                context,
+                module,
+            )?;
+            let alloca = builder
+                .build_alloca(
+                    as_llvm_type(&param.param_type, context, program)?,
+                    &sanitize_llvm_name(&param.name),
+                )
+                .map_err(|e| format!("build_alloca failed: {:?}", e))?;
+            builder
+                .build_store(alloca, value)
+                .map_err(|e| format!("build_store failed: {:?}", e))?;
+            constructor_locals.insert(
+                param.name.clone(),
+                LocalValue::Pointer(alloca, param.param_type.clone(), false, false),
+            );
+        }
+
+        let constructor_func = FunctionDef {
+            name: "构造方法".to_string(),
+            module_path: Some(crate::parser::object_module_path(name)),
+            params: constructor.params.clone(),
+            return_type: Type::Void,
+            is_entry: false,
+            is_external: false,
+            external_symbol: None,
+            body: constructor.body.clone(),
+        };
+        let function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| "Missing current function for constructor".to_string())?;
+        let mut constructor_imports = scoped_imports.to_vec();
+        for stmt in &constructor.body {
+            compile_stmt(
+                stmt,
+                &constructor_func,
+                program,
+                &mut constructor_imports,
+                &mut constructor_locals,
+                &function,
+                builder,
+                context,
+                module,
+            )?;
+        }
+    } else if !args.is_empty() {
+        return Err(format!("对象 `{}` 没有构造方法，创建时不能传入参数", name));
+    }
+
+    Ok(ptr.into())
+}
+
 fn compile_field_access<'ctx>(
     base: &Expr,
     field: &str,
@@ -1951,10 +2280,30 @@ fn compile_field_access<'ctx>(
     let Type::Struct(struct_name) = &base_type else {
         return Err(format!("不能对 {} 类型使用字段访问", type_name(&base_type)));
     };
-    let (field_index, field_type) = struct_field_info(program, struct_name, field)?;
+    if is_object_name(program, struct_name) {
+        let (field_ptr, field_type) = compile_field_ptr(
+            base,
+            field,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        )?;
+        return builder
+            .build_load(
+                as_llvm_type(&field_type, context, program)?,
+                field_ptr,
+                "object.field",
+            )
+            .map_err(|e| format!("build_load failed: {:?}", e));
+    }
+    let (field_index, _field_type) = struct_field_info(program, struct_name, field)?;
 
     if let Expr::Ident(name) = base {
-        let LocalValue::Pointer(ptr, _, _) = locals
+        let LocalValue::Pointer(ptr, _, _, _) = locals
             .get(name)
             .cloned()
             .ok_or_else(|| format!("未定义的变量: {}", name))?;
@@ -1964,7 +2313,7 @@ fn compile_field_access<'ctx>(
             .map_err(|e| format!("build_struct_gep failed: {:?}", e))?;
         return builder
             .build_load(
-                as_llvm_type(&field_type, context, program)?,
+                as_llvm_type(&_field_type, context, program)?,
                 field_ptr,
                 "struct.field",
             )
@@ -1988,6 +2337,57 @@ fn compile_field_access<'ctx>(
             "struct.field",
         )
         .map_err(|e| format!("build_extract_value failed: {:?}", e))
+}
+
+fn compile_field_ptr<'ctx>(
+    base: &Expr,
+    field: &str,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(PointerValue<'ctx>, Type), String> {
+    let base_type = infer_type_from_expr(base, current_func, program, scoped_imports, locals)?;
+    let Type::Struct(type_name_value) = &base_type else {
+        return Err(format!("不能对 {} 类型使用字段访问", type_name(&base_type)));
+    };
+    let (field_index, field_type) = struct_field_info(program, type_name_value, field)?;
+    let aggregate_type = aggregate_struct_type(type_name_value, context, program)?;
+
+    let aggregate_ptr = if is_object_name(program, type_name_value) {
+        compile_expr(
+            base,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        )?
+        .into_pointer_value()
+    } else if let Expr::Ident(name) = base {
+        let LocalValue::Pointer(ptr, _, _, _) = locals
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("未定义的变量: {}", name))?;
+        ptr
+    } else {
+        return Err("当前只支持给变量上的结构字段赋值".to_string());
+    };
+
+    let field_ptr = builder
+        .build_struct_gep(
+            aggregate_type,
+            aggregate_ptr,
+            field_index as u32,
+            "aggregate.field.ptr",
+        )
+        .map_err(|e| format!("build_struct_gep failed: {:?}", e))?;
+    Ok((field_ptr, field_type))
 }
 
 fn compile_array_index<'ctx>(
@@ -2038,7 +2438,7 @@ fn compile_array_element_ptr<'ctx>(
     let local = locals
         .get(name)
         .ok_or_else(|| format!("未定义的变量: {}", name))?;
-    let LocalValue::Pointer(array_ptr, array_type, _) = local.clone();
+    let LocalValue::Pointer(array_ptr, array_type, _, _) = local.clone();
     let Type::Array {
         element_type,
         length,
@@ -2181,8 +2581,33 @@ fn compile_formatted_string<'ctx>(
 
 fn local_type<'ctx>(local: &LocalValue<'ctx>) -> Type {
     match local {
-        LocalValue::Pointer(_, ty, _) => ty.clone(),
+        LocalValue::Pointer(_, ty, _, _) => ty.clone(),
     }
+}
+
+fn free_owned_objects<'ctx>(
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    program: &Program,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+) -> Result<(), String> {
+    for local in locals.values() {
+        let LocalValue::Pointer(ptr, ty, _, owns_heap) = local;
+        let Type::Struct(name) = ty else {
+            continue;
+        };
+        if !*owns_heap || !is_object_name(program, name) {
+            continue;
+        }
+        let object_ptr = builder
+            .build_load(as_llvm_type(ty, context, program)?, *ptr, "object.free.ptr")
+            .map_err(|e| format!("build_load failed: {:?}", e))?
+            .into_pointer_value();
+        builder
+            .build_free(object_ptr)
+            .map_err(|e| format!("build_free failed: {:?}", e))?;
+    }
+    Ok(())
 }
 
 fn type_name(ty: &Type) -> String {
@@ -2213,7 +2638,7 @@ fn load_local_value<'ctx>(
     program: &Program,
 ) -> Result<BasicValueEnum<'ctx>, String> {
     match local {
-        LocalValue::Pointer(ptr, ty, _) => builder
+        LocalValue::Pointer(ptr, ty, _, _) => builder
             .build_load(
                 as_llvm_type(&ty, context, program)?,
                 ptr,
@@ -2360,5 +2785,33 @@ mod tests {
         assert!(ir.contains("alloca { double, double, double }"));
         assert!(ir.contains("getelementptr inbounds"));
         assert!(ir.contains("load double"));
+    }
+
+    #[test]
+    fn test_object_create_method_call_and_raii_free() {
+        let ir = generate_ir(
+            "定义对象向量：
+结构：
+    x：小数，
+    y：小数
+构造方法（x：小数，y：小数）：
+    令当前->x=x
+    令当前->y=y
+公共成员：
+    定义方法相乘（另一个向量：向量）返回 小数：
+        返回 当前->x*另一个向量->x+当前->y*另一个向量->y
+    。。
+。。
+定义 方法 求积（）返回 小数：
+设 向量1=创建向量（10.0，15.0）
+设 向量2=创建向量（10.0，10.0）
+返回 向量1->相乘（向量2）
+。。",
+        );
+
+        assert!(ir.contains("malloc"));
+        assert!(ir.contains("free"));
+        assert!(ir.contains("call double"));
+        assert!(ir.contains("getelementptr inbounds"));
     }
 }
