@@ -12,9 +12,11 @@ pub enum Token {
     External, // 外部
 
     // Definitions
-    Define, // 定义
-    Method, // 方法
-    Module, // 模块
+    Define,    // 定义
+    Method,    // 方法
+    Module,    // 模块
+    StructKw,  // 结构
+    Construct, // 构造
 
     // Control flow
     ReturnKw,  // 返回
@@ -80,6 +82,7 @@ pub enum Token {
     // Values
     Ident(String),
     IntLiteral(i64),
+    DoubleLiteral(f64),
     StringLiteral(String),
     FormattedStringLiteral(String),
 
@@ -207,6 +210,8 @@ impl Lexer {
                     ['定', '义'] => Some(Token::Define),
                     ['方', '法'] => Some(Token::Method),
                     ['模', '块'] => Some(Token::Module),
+                    ['结', '构'] => Some(Token::StructKw),
+                    ['构', '造'] => Some(Token::Construct),
                     ['返', '回'] => Some(Token::ReturnKw),
                     ['判', '断'] => Some(Token::If),
                     ['否', '则'] => Some(Token::Else),
@@ -305,6 +310,8 @@ impl Lexer {
                         | ['定', '义']
                         | ['方', '法']
                         | ['模', '块']
+                        | ['结', '构']
+                        | ['构', '造']
                         | ['返', '回']
                         | ['判', '断']
                         | ['否', '则']
@@ -342,7 +349,7 @@ impl Lexer {
             || ch1 == '或'
     }
 
-    /// Read an integer literal starting at the current position.
+    /// Read an integer or decimal literal starting at the current position.
     fn read_number(&mut self) -> Token {
         let mut num_str = String::new();
         while let Some(ch) = self.current() {
@@ -352,6 +359,22 @@ impl Lexer {
             } else {
                 break;
             }
+        }
+        if self.current() == Some('.') && self.peek(1).is_some_and(|ch| ch.is_ascii_digit()) {
+            num_str.push('.');
+            self.advance();
+            while let Some(ch) = self.current() {
+                if ch.is_ascii_digit() {
+                    num_str.push(ch);
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            return match num_str.parse() {
+                Ok(val) => Token::DoubleLiteral(val),
+                Err(_) => Token::Error(format!("小数文字 `{}` 无法解析", num_str)),
+            };
         }
         match num_str.parse() {
             Ok(val) => Token::IntLiteral(val),
@@ -667,6 +690,53 @@ mod tests {
             let tok = lexer.next_token();
             assert_eq!(tok, exp, "Token mismatch");
         }
+    }
+
+    #[test]
+    fn test_struct_definition_tokens() {
+        let source = "定义结构坐标：x：小数，y：小数。。";
+        let mut lexer = Lexer::new(source);
+
+        let expected = vec![
+            Token::Define,
+            Token::StructKw,
+            Token::Ident("坐标".to_string()),
+            Token::Colon,
+            Token::Ident("x".to_string()),
+            Token::Colon,
+            Token::DoubleKw,
+            Token::Comma,
+            Token::Ident("y".to_string()),
+            Token::Colon,
+            Token::DoubleKw,
+            Token::ScopeEnd,
+            Token::Eof,
+        ];
+
+        for exp in expected {
+            let tok = lexer.next_token();
+            assert_eq!(tok, exp, "Token mismatch");
+        }
+    }
+
+    #[test]
+    fn test_construct_and_double_literal_tokens() {
+        let source = "设 原点=构造坐标：x：0.0。。 原点->x";
+        let mut lexer = Lexer::new(source);
+
+        assert_eq!(lexer.next_token(), Token::Let);
+        assert_eq!(lexer.next_token(), Token::Ident("原点".to_string()));
+        assert_eq!(lexer.next_token(), Token::Equals);
+        assert_eq!(lexer.next_token(), Token::Construct);
+        assert_eq!(lexer.next_token(), Token::Ident("坐标".to_string()));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::Ident("x".to_string()));
+        assert_eq!(lexer.next_token(), Token::Colon);
+        assert_eq!(lexer.next_token(), Token::DoubleLiteral(0.0));
+        assert_eq!(lexer.next_token(), Token::ScopeEnd);
+        assert_eq!(lexer.next_token(), Token::Ident("原点".to_string()));
+        assert_eq!(lexer.next_token(), Token::Arrow);
+        assert_eq!(lexer.next_token(), Token::Ident("x".to_string()));
     }
 
     #[test]

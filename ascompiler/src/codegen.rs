@@ -30,7 +30,7 @@ pub fn generate<'ctx>(
     module: &Module<'ctx>,
 ) -> Result<(), String> {
     for func in &program.functions {
-        declare_function(func, context, module)?;
+        declare_function(func, program, context, module)?;
     }
     for func in &program.functions {
         compile_function(func, program, context, module)?;
@@ -39,21 +39,38 @@ pub fn generate<'ctx>(
 }
 
 /// Map a 问源 type to an LLVM basic type.
-fn as_llvm_type<'ctx>(ty: &Type, context: &'ctx Context) -> BasicTypeEnum<'ctx> {
+fn as_llvm_type<'ctx>(
+    ty: &Type,
+    context: &'ctx Context,
+    program: &Program,
+) -> Result<BasicTypeEnum<'ctx>, String> {
     match ty {
-        Type::Void => context.i32_type().into(),
-        Type::Int => context.i32_type().into(),
-        Type::Double => context.f64_type().into(),
-        Type::Float => context.f32_type().into(),
-        Type::Bool => context.bool_type().into(),
-        Type::Char => context.i8_type().into(),
-        Type::String => context.ptr_type(AddressSpace::from(0u16)).into(),
+        Type::Void => Ok(context.i32_type().into()),
+        Type::Int => Ok(context.i32_type().into()),
+        Type::Double => Ok(context.f64_type().into()),
+        Type::Float => Ok(context.f32_type().into()),
+        Type::Bool => Ok(context.bool_type().into()),
+        Type::Char => Ok(context.i8_type().into()),
+        Type::String => Ok(context.ptr_type(AddressSpace::from(0u16)).into()),
+        Type::Struct(name) => {
+            let struct_def = program
+                .structs
+                .iter()
+                .find(|candidate| candidate.name == *name)
+                .ok_or_else(|| format!("未定义的结构: {}", name))?;
+            let field_types = struct_def
+                .fields
+                .iter()
+                .map(|field| as_llvm_type(&field.field_type, context, program))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(context.struct_type(&field_types, false).into())
+        }
         Type::Array {
             element_type,
             length,
-        } => as_llvm_type(element_type, context)
+        } => Ok(as_llvm_type(element_type, context, program)?
             .array_type(length.expect("array type must have a known length") as u32)
-            .into(),
+            .into()),
     }
 }
 
@@ -98,6 +115,7 @@ fn llvm_function_name(func: &FunctionDef) -> String {
 
 fn declare_function<'ctx>(
     func: &FunctionDef,
+    program: &Program,
     context: &'ctx Context,
     module: &Module<'ctx>,
 ) -> Result<FunctionValue<'ctx>, String> {
@@ -109,15 +127,15 @@ fn declare_function<'ctx>(
     let param_types: Vec<BasicMetadataTypeEnum> = func
         .params
         .iter()
-        .map(|p| as_llvm_type(&p.param_type, context).into())
-        .collect();
+        .map(|p| Ok(as_llvm_type(&p.param_type, context, program)?.into()))
+        .collect::<Result<_, String>>()?;
 
     let fn_type = if func.is_entry {
         context.i32_type().fn_type(&param_types, false)
     } else if func.return_type == Type::Void {
         context.void_type().fn_type(&param_types, false)
     } else {
-        as_llvm_type(&func.return_type, context).fn_type(&param_types, false)
+        as_llvm_type(&func.return_type, context, program)?.fn_type(&param_types, false)
     };
     Ok(module.add_function(&llvm_name, fn_type, None))
 }
@@ -158,7 +176,7 @@ fn compile_function<'ctx>(
         if let Some(value) = function.get_nth_param(i as u32) {
             let alloca = builder
                 .build_alloca(
-                    as_llvm_type(&param.param_type, context),
+                    as_llvm_type(&param.param_type, context, program)?,
                     &sanitize_llvm_name(&param.name),
                 )
                 .map_err(|e| format!("build_alloca failed: {:?}", e))?;
@@ -226,8 +244,14 @@ fn compile_function<'ctx>(
                     ));
                 }
                 Type::Array { .. } => {
-                    let _ = builder
-                        .build_return(Some(&as_llvm_type(&func.return_type, context).const_zero()));
+                    let _ = builder.build_return(Some(
+                        &as_llvm_type(&func.return_type, context, program)?.const_zero(),
+                    ));
+                }
+                Type::Struct(_) => {
+                    let _ = builder.build_return(Some(
+                        &as_llvm_type(&func.return_type, context, program)?.const_zero(),
+                    ));
                 }
                 Type::Void => unreachable!(),
             }
@@ -353,7 +377,7 @@ fn compile_var_decl<'ctx>(
 ) -> Result<(), String> {
     // Determine the LLVM type
     let var_type = resolve_var_type(var, current_func, program, scoped_imports, locals)?;
-    let llvm_type = as_llvm_type(&var_type, context);
+    let llvm_type = as_llvm_type(&var_type, context, program)?;
 
     // Alloca
     let sanitized_name = sanitize_llvm_name(&var.name);
@@ -746,7 +770,13 @@ fn compile_select_case_condition<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
 ) -> Result<IntValue<'ctx>, String> {
-    let target_value = load_local_value(target_local.clone(), "select.target", builder, context)?;
+    let target_value = load_local_value(
+        target_local.clone(),
+        "select.target",
+        builder,
+        context,
+        program,
+    )?;
     let case_value = compile_expr(
         case_value,
         current_func,
@@ -1171,11 +1201,12 @@ fn compile_expr<'ctx>(
 ) -> Result<BasicValueEnum<'ctx>, String> {
     match expr {
         Expr::IntLiteral(val) => Ok(context.i32_type().const_int(*val as u64, true).into()),
+        Expr::DoubleLiteral(val) => Ok(context.f64_type().const_float(*val).into()),
         Expr::Ident(name) => {
             let local = locals
                 .get(name)
                 .ok_or_else(|| format!("未定义的变量: {}", name))?;
-            load_local_value(local.clone(), name, builder, context)
+            load_local_value(local.clone(), name, builder, context, program)
         }
         Expr::Call { target, args, .. } => compile_call_expr(
             target,
@@ -1194,11 +1225,29 @@ fn compile_expr<'ctx>(
                 .map_err(|e| format!("build_global_string_ptr failed: {:?}", e))?;
             Ok(global.as_pointer_value().into())
         }
-        Expr::FormattedString(parts) => {
-            compile_formatted_string(parts, locals, builder, context, module)
-        }
+        Expr::FormattedString(parts) => compile_formatted_string(
+            parts,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
         Expr::ArrayLiteral(elements) => compile_array_literal(
             elements,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
+        Expr::StructLiteral { name, fields } => compile_struct_literal(
+            name,
+            fields,
             current_func,
             program,
             scoped_imports,
@@ -1210,6 +1259,17 @@ fn compile_expr<'ctx>(
         Expr::Index { array, index } => compile_array_index(
             array,
             index,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        ),
+        Expr::FieldAccess { base, field } => compile_field_access(
+            base,
+            field,
             current_func,
             program,
             scoped_imports,
@@ -1231,11 +1291,19 @@ fn compile_expr<'ctx>(
             )?;
             match op {
                 UnaryOp::Neg => {
-                    let int_value = value.into_int_value();
-                    builder
-                        .build_int_neg(int_value, "negtmp")
-                        .map(Into::into)
-                        .map_err(|e| format!("build_int_neg failed: {:?}", e))
+                    let value_type =
+                        infer_type_from_expr(expr, current_func, program, scoped_imports, locals)?;
+                    if value_type == Type::Double {
+                        builder
+                            .build_float_neg(value.into_float_value(), "fnegtmp")
+                            .map(Into::into)
+                            .map_err(|e| format!("build_float_neg failed: {:?}", e))
+                    } else {
+                        builder
+                            .build_int_neg(value.into_int_value(), "negtmp")
+                            .map(Into::into)
+                            .map_err(|e| format!("build_int_neg failed: {:?}", e))
+                    }
                 }
                 UnaryOp::Not => compile_bool_expr(
                     expr,
@@ -1257,39 +1325,77 @@ fn compile_expr<'ctx>(
         }
         Expr::Binary { left, op, right } => match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
-                let lhs = compile_expr(
-                    left,
-                    current_func,
-                    program,
-                    scoped_imports,
-                    locals,
-                    builder,
-                    context,
-                    module,
-                )?
-                .into_int_value();
-                let rhs = compile_expr(
-                    right,
-                    current_func,
-                    program,
-                    scoped_imports,
-                    locals,
-                    builder,
-                    context,
-                    module,
-                )?
-                .into_int_value();
-                let result = match op {
-                    BinaryOp::Add => builder.build_int_add(lhs, rhs, "addtmp"),
-                    BinaryOp::Sub => builder.build_int_sub(lhs, rhs, "subtmp"),
-                    BinaryOp::Mul => builder.build_int_mul(lhs, rhs, "multmp"),
-                    BinaryOp::Div => builder.build_int_signed_div(lhs, rhs, "divtmp"),
-                    BinaryOp::Rem => builder.build_int_signed_rem(lhs, rhs, "remtmp"),
-                    _ => unreachable!(),
-                };
-                result
-                    .map(Into::into)
-                    .map_err(|e| format!("integer operation failed: {:?}", e))
+                let left_ty =
+                    infer_type_from_expr(left, current_func, program, scoped_imports, locals)?;
+                if left_ty == Type::Double {
+                    let lhs = compile_expr(
+                        left,
+                        current_func,
+                        program,
+                        scoped_imports,
+                        locals,
+                        builder,
+                        context,
+                        module,
+                    )?
+                    .into_float_value();
+                    let rhs = compile_expr(
+                        right,
+                        current_func,
+                        program,
+                        scoped_imports,
+                        locals,
+                        builder,
+                        context,
+                        module,
+                    )?
+                    .into_float_value();
+                    let result = match op {
+                        BinaryOp::Add => builder.build_float_add(lhs, rhs, "faddtmp"),
+                        BinaryOp::Sub => builder.build_float_sub(lhs, rhs, "fsubtmp"),
+                        BinaryOp::Mul => builder.build_float_mul(lhs, rhs, "fmultmp"),
+                        BinaryOp::Div => builder.build_float_div(lhs, rhs, "fdivtmp"),
+                        BinaryOp::Rem => builder.build_float_rem(lhs, rhs, "fremtmp"),
+                        _ => unreachable!(),
+                    };
+                    result
+                        .map(Into::into)
+                        .map_err(|e| format!("float operation failed: {:?}", e))
+                } else {
+                    let lhs = compile_expr(
+                        left,
+                        current_func,
+                        program,
+                        scoped_imports,
+                        locals,
+                        builder,
+                        context,
+                        module,
+                    )?
+                    .into_int_value();
+                    let rhs = compile_expr(
+                        right,
+                        current_func,
+                        program,
+                        scoped_imports,
+                        locals,
+                        builder,
+                        context,
+                        module,
+                    )?
+                    .into_int_value();
+                    let result = match op {
+                        BinaryOp::Add => builder.build_int_add(lhs, rhs, "addtmp"),
+                        BinaryOp::Sub => builder.build_int_sub(lhs, rhs, "subtmp"),
+                        BinaryOp::Mul => builder.build_int_mul(lhs, rhs, "multmp"),
+                        BinaryOp::Div => builder.build_int_signed_div(lhs, rhs, "divtmp"),
+                        BinaryOp::Rem => builder.build_int_signed_rem(lhs, rhs, "remtmp"),
+                        _ => unreachable!(),
+                    };
+                    result
+                        .map(Into::into)
+                        .map_err(|e| format!("integer operation failed: {:?}", e))
+                }
             }
             BinaryOp::Eq
             | BinaryOp::NotEq
@@ -1297,41 +1403,81 @@ fn compile_expr<'ctx>(
             | BinaryOp::LessEq
             | BinaryOp::Greater
             | BinaryOp::GreaterEq => {
-                let lhs = compile_expr(
-                    left,
-                    current_func,
-                    program,
-                    scoped_imports,
-                    locals,
-                    builder,
-                    context,
-                    module,
-                )?
-                .into_int_value();
-                let rhs = compile_expr(
-                    right,
-                    current_func,
-                    program,
-                    scoped_imports,
-                    locals,
-                    builder,
-                    context,
-                    module,
-                )?
-                .into_int_value();
-                let pred = match op {
-                    BinaryOp::Eq => IntPredicate::EQ,
-                    BinaryOp::NotEq => IntPredicate::NE,
-                    BinaryOp::Less => IntPredicate::SLT,
-                    BinaryOp::LessEq => IntPredicate::SLE,
-                    BinaryOp::Greater => IntPredicate::SGT,
-                    BinaryOp::GreaterEq => IntPredicate::SGE,
-                    _ => unreachable!(),
-                };
-                builder
-                    .build_int_compare(pred, lhs, rhs, "cmptmp")
-                    .map(Into::into)
-                    .map_err(|e| format!("build_int_compare failed: {:?}", e))
+                let left_ty =
+                    infer_type_from_expr(left, current_func, program, scoped_imports, locals)?;
+                if left_ty == Type::Double {
+                    let lhs = compile_expr(
+                        left,
+                        current_func,
+                        program,
+                        scoped_imports,
+                        locals,
+                        builder,
+                        context,
+                        module,
+                    )?
+                    .into_float_value();
+                    let rhs = compile_expr(
+                        right,
+                        current_func,
+                        program,
+                        scoped_imports,
+                        locals,
+                        builder,
+                        context,
+                        module,
+                    )?
+                    .into_float_value();
+                    let pred = match op {
+                        BinaryOp::Eq => inkwell::FloatPredicate::OEQ,
+                        BinaryOp::NotEq => inkwell::FloatPredicate::ONE,
+                        BinaryOp::Less => inkwell::FloatPredicate::OLT,
+                        BinaryOp::LessEq => inkwell::FloatPredicate::OLE,
+                        BinaryOp::Greater => inkwell::FloatPredicate::OGT,
+                        BinaryOp::GreaterEq => inkwell::FloatPredicate::OGE,
+                        _ => unreachable!(),
+                    };
+                    builder
+                        .build_float_compare(pred, lhs, rhs, "fcmptmp")
+                        .map(Into::into)
+                        .map_err(|e| format!("build_float_compare failed: {:?}", e))
+                } else {
+                    let lhs = compile_expr(
+                        left,
+                        current_func,
+                        program,
+                        scoped_imports,
+                        locals,
+                        builder,
+                        context,
+                        module,
+                    )?
+                    .into_int_value();
+                    let rhs = compile_expr(
+                        right,
+                        current_func,
+                        program,
+                        scoped_imports,
+                        locals,
+                        builder,
+                        context,
+                        module,
+                    )?
+                    .into_int_value();
+                    let pred = match op {
+                        BinaryOp::Eq => IntPredicate::EQ,
+                        BinaryOp::NotEq => IntPredicate::NE,
+                        BinaryOp::Less => IntPredicate::SLT,
+                        BinaryOp::LessEq => IntPredicate::SLE,
+                        BinaryOp::Greater => IntPredicate::SGT,
+                        BinaryOp::GreaterEq => IntPredicate::SGE,
+                        _ => unreachable!(),
+                    };
+                    builder
+                        .build_int_compare(pred, lhs, rhs, "cmptmp")
+                        .map(Into::into)
+                        .map_err(|e| format!("build_int_compare failed: {:?}", e))
+                }
             }
             BinaryOp::And | BinaryOp::Or => compile_logical_expr(
                 left,
@@ -1514,6 +1660,7 @@ fn infer_type_from_expr<'ctx>(
 ) -> Result<Type, String> {
     match expr {
         Expr::IntLiteral(_) => Ok(Type::Int),
+        Expr::DoubleLiteral(_) => Ok(Type::Double),
         Expr::Ident(name) => locals
             .get(name)
             .map(local_type)
@@ -1533,14 +1680,13 @@ fn infer_type_from_expr<'ctx>(
             if let Expr::FormattedString(parts) = expr {
                 for part in parts {
                     if let FormatPart::Placeholder(name) = part {
-                        locals
-                            .get(name)
-                            .ok_or_else(|| format!("未定义的格式化变量: {}", name))?;
+                        infer_format_placeholder_type(name, program, locals)?;
                     }
                 }
             }
             Ok(Type::String)
         }
+        Expr::StructLiteral { name, .. } => Ok(Type::Struct(name.clone())),
         Expr::ArrayLiteral(elements) => {
             if elements.is_empty() {
                 return Err("数组字面量不能为空".to_string());
@@ -1576,15 +1722,18 @@ fn infer_type_from_expr<'ctx>(
                 other => Err(format!("不能对 {} 类型使用数组访问", type_name(&other))),
             }
         }
+        Expr::FieldAccess { base, field } => {
+            infer_field_type(base, field, current_func, program, scoped_imports, locals)
+        }
         Expr::Unary { op, expr } => match op {
             UnaryOp::Neg => {
                 infer_type_from_expr(expr, current_func, program, scoped_imports, locals)
             }
             UnaryOp::Not => Ok(Type::Bool),
         },
-        Expr::Binary { op, .. } => match op {
+        Expr::Binary { left, op, .. } => match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
-                Ok(Type::Int)
+                infer_type_from_expr(left, current_func, program, scoped_imports, locals)
             }
             BinaryOp::Eq
             | BinaryOp::NotEq
@@ -1596,6 +1745,61 @@ fn infer_type_from_expr<'ctx>(
             | BinaryOp::Or => Ok(Type::Bool),
         },
     }
+}
+
+fn infer_field_type<'ctx>(
+    base: &Expr,
+    field: &str,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+) -> Result<Type, String> {
+    let base_type = infer_type_from_expr(base, current_func, program, scoped_imports, locals)?;
+    let Type::Struct(struct_name) = base_type else {
+        return Err(format!("不能对 {} 类型使用字段访问", type_name(&base_type)));
+    };
+    struct_field_info(program, &struct_name, field).map(|(_, ty)| ty)
+}
+
+fn infer_format_placeholder_type<'ctx>(
+    name: &str,
+    program: &Program,
+    locals: &HashMap<String, LocalValue<'ctx>>,
+) -> Result<Type, String> {
+    if let Some((base, field)) = name.split_once("->") {
+        let base_ty = locals
+            .get(base.trim())
+            .map(local_type)
+            .ok_or_else(|| format!("未定义的格式化变量: {}", base.trim()))?;
+        let Type::Struct(struct_name) = base_ty else {
+            return Err(format!("不能对 {} 类型使用字段访问", type_name(&base_ty)));
+        };
+        return struct_field_info(program, &struct_name, field.trim()).map(|(_, ty)| ty);
+    }
+    locals
+        .get(name)
+        .map(local_type)
+        .ok_or_else(|| format!("未定义的格式化变量: {}", name))
+}
+
+fn struct_field_info(
+    program: &Program,
+    struct_name: &str,
+    field: &str,
+) -> Result<(usize, Type), String> {
+    let struct_def = program
+        .structs
+        .iter()
+        .find(|candidate| candidate.name == struct_name)
+        .ok_or_else(|| format!("未定义的结构: {}", struct_name))?;
+    struct_def
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, candidate)| candidate.name == field)
+        .map(|(index, field_def)| (index, field_def.field_type.clone()))
+        .ok_or_else(|| format!("结构 `{}` 没有字段 `{}`", struct_name, field))
 }
 
 fn resolve_var_type<'ctx>(
@@ -1690,6 +1894,102 @@ fn compile_array_literal<'ctx>(
     Ok(array_value.into())
 }
 
+fn compile_struct_literal<'ctx>(
+    name: &str,
+    fields: &[(String, Expr)],
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, String> {
+    let struct_type =
+        as_llvm_type(&Type::Struct(name.to_string()), context, program)?.into_struct_type();
+    let struct_def = program
+        .structs
+        .iter()
+        .find(|candidate| candidate.name == name)
+        .ok_or_else(|| format!("未定义的结构: {}", name))?;
+    let mut struct_value = struct_type.const_zero();
+    for (index, field) in struct_def.fields.iter().enumerate() {
+        let (_, expr) = fields
+            .iter()
+            .find(|(field_name, _)| field_name == &field.name)
+            .ok_or_else(|| format!("构造 `{}` 缺少字段 `{}`", name, field.name))?;
+        let value = compile_expr(
+            expr,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        )?;
+        struct_value = builder
+            .build_insert_value(struct_value, value, index as u32, "struct.insert")
+            .map_err(|e| format!("build_insert_value failed: {:?}", e))?
+            .into_struct_value();
+    }
+    Ok(struct_value.into())
+}
+
+fn compile_field_access<'ctx>(
+    base: &Expr,
+    field: &str,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, String> {
+    let base_type = infer_type_from_expr(base, current_func, program, scoped_imports, locals)?;
+    let Type::Struct(struct_name) = &base_type else {
+        return Err(format!("不能对 {} 类型使用字段访问", type_name(&base_type)));
+    };
+    let (field_index, field_type) = struct_field_info(program, struct_name, field)?;
+
+    if let Expr::Ident(name) = base {
+        let LocalValue::Pointer(ptr, _, _) = locals
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("未定义的变量: {}", name))?;
+        let struct_type = as_llvm_type(&base_type, context, program)?.into_struct_type();
+        let field_ptr = builder
+            .build_struct_gep(struct_type, ptr, field_index as u32, "struct.field.ptr")
+            .map_err(|e| format!("build_struct_gep failed: {:?}", e))?;
+        return builder
+            .build_load(
+                as_llvm_type(&field_type, context, program)?,
+                field_ptr,
+                "struct.field",
+            )
+            .map_err(|e| format!("build_load failed: {:?}", e));
+    }
+
+    let struct_value = compile_expr(
+        base,
+        current_func,
+        program,
+        scoped_imports,
+        locals,
+        builder,
+        context,
+        module,
+    )?;
+    builder
+        .build_extract_value(
+            struct_value.into_struct_value(),
+            field_index as u32,
+            "struct.field",
+        )
+        .map_err(|e| format!("build_extract_value failed: {:?}", e))
+}
+
 fn compile_array_index<'ctx>(
     array: &Expr,
     index: &Expr,
@@ -1717,7 +2017,7 @@ fn compile_array_index<'ctx>(
     )?;
     builder
         .build_load(
-            as_llvm_type(&element_type, context),
+            as_llvm_type(&element_type, context, program)?,
             element_ptr,
             "array.elem",
         )
@@ -1753,7 +2053,8 @@ fn compile_array_element_ptr<'ctx>(
             length: Some(length),
         },
         context,
-    );
+        program,
+    )?;
     let index_value = compile_expr(
         index,
         current_func,
@@ -1779,8 +2080,49 @@ fn compile_array_element_ptr<'ctx>(
     Ok((element_ptr, *element_type))
 }
 
+fn compile_format_placeholder<'ctx>(
+    name: &str,
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalValue<'ctx>>,
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(Type, BasicValueEnum<'ctx>), String> {
+    if let Some((base, field)) = name.split_once("->") {
+        let expr = Expr::FieldAccess {
+            base: Box::new(Expr::Ident(base.trim().to_string())),
+            field: field.trim().to_string(),
+        };
+        let ty = infer_type_from_expr(&expr, current_func, program, scoped_imports, locals)?;
+        let value = compile_expr(
+            &expr,
+            current_func,
+            program,
+            scoped_imports,
+            locals,
+            builder,
+            context,
+            module,
+        )?;
+        return Ok((ty, value));
+    }
+
+    let local = locals
+        .get(name)
+        .ok_or_else(|| format!("未定义的格式化变量: {}", name))?;
+    Ok((
+        local_type(local),
+        load_local_value(local.clone(), name, builder, context, program)?,
+    ))
+}
+
 fn compile_formatted_string<'ctx>(
     parts: &[FormatPart],
+    current_func: &FunctionDef,
+    program: &Program,
+    scoped_imports: &[ImportDecl],
     locals: &HashMap<String, LocalValue<'ctx>>,
     builder: &Builder<'ctx>,
     context: &'ctx Context,
@@ -1793,11 +2135,19 @@ fn compile_formatted_string<'ctx>(
         match part {
             FormatPart::Text(text) => format.push_str(&text.replace('%', "%%")),
             FormatPart::Placeholder(name) => {
-                let local = locals
-                    .get(name)
-                    .ok_or_else(|| format!("未定义的格式化变量: {}", name))?;
-                match local_type(local) {
+                let (ty, value) = compile_format_placeholder(
+                    name,
+                    current_func,
+                    program,
+                    scoped_imports,
+                    locals,
+                    builder,
+                    context,
+                    module,
+                )?;
+                match ty {
                     Type::Int => format.push_str("%d"),
+                    Type::Double => format.push_str("%g"),
                     Type::String => format.push_str("%s"),
                     other => {
                         return Err(format!(
@@ -1806,7 +2156,7 @@ fn compile_formatted_string<'ctx>(
                         ));
                     }
                 }
-                args.push(load_local_value(local.clone(), name, builder, context)?);
+                args.push(value);
             }
         }
     }
@@ -1844,6 +2194,7 @@ fn type_name(ty: &Type) -> String {
         Type::Bool => "布尔".to_string(),
         Type::Char => "字符".to_string(),
         Type::String => "字符串".to_string(),
+        Type::Struct(name) => format!("结构{}", name),
         Type::Array {
             element_type,
             length,
@@ -1859,11 +2210,12 @@ fn load_local_value<'ctx>(
     name: &str,
     builder: &Builder<'ctx>,
     context: &'ctx Context,
+    program: &Program,
 ) -> Result<BasicValueEnum<'ctx>, String> {
     match local {
         LocalValue::Pointer(ptr, ty, _) => builder
             .build_load(
-                as_llvm_type(&ty, context),
+                as_llvm_type(&ty, context, program)?,
                 ptr,
                 &format!("load.{}", sanitize_llvm_name(name)),
             )
@@ -1993,5 +2345,20 @@ mod tests {
 
         assert!(ir.contains("declare void @wen_print(ptr)"));
         assert!(ir.contains("call void @wen_print"));
+    }
+
+    #[test]
+    fn test_struct_literal_allocates_and_loads_field() {
+        let ir = generate_ir(
+            "定义结构坐标：x：小数，y：小数，z：小数。。
+定义 方法 求x（）返回 小数：
+设 原点=构造坐标：x：0.0，y：1.0，z：2.0。。
+返回 原点->x
+。。",
+        );
+
+        assert!(ir.contains("alloca { double, double, double }"));
+        assert!(ir.contains("getelementptr inbounds"));
+        assert!(ir.contains("load double"));
     }
 }

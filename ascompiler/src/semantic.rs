@@ -1,7 +1,7 @@
 use crate::lexer::Span;
 use crate::parser::{
     ArrayAssignStmt, AssignStmt, BinaryOp, Expr, FormatPart, FunctionDef, ImportDecl, Program,
-    ReturnStmt, Stmt, Type, UnaryOp, VarDecl,
+    ReturnStmt, Stmt, StructDef, Type, UnaryOp, VarDecl,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -65,7 +65,14 @@ pub fn analyze_with_source(
         validate_import(import, &registry)?;
     }
 
+    validate_structs(&program.structs)?;
+
     for func in &program.functions {
+        for param in &func.params {
+            validate_declared_type(&param.param_type, program)?;
+        }
+        validate_declared_type(&func.return_type, program)?;
+
         let mut scoped_imports = program.imports.clone();
         let mut locals: HashMap<String, LocalInfo> = func
             .params
@@ -555,6 +562,154 @@ fn validate_condition(
     }
 }
 
+fn validate_structs(structs: &[StructDef]) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for struct_def in structs {
+        if !names.insert(struct_def.name.clone()) {
+            return Err(format!("结构 `{}` 重复定义", struct_def.name));
+        }
+        if struct_def.fields.is_empty() {
+            return Err(format!(
+                "结构 `{}` 至少需要一个字段\n  = 帮助: 写成 `定义结构{}：字段：整数。。`。",
+                struct_def.name, struct_def.name
+            ));
+        }
+        let mut field_names = HashSet::new();
+        for field in &struct_def.fields {
+            if !field_names.insert(field.name.clone()) {
+                return Err(format!(
+                    "结构 `{}` 中字段 `{}` 重复定义",
+                    struct_def.name, field.name
+                ));
+            }
+        }
+    }
+    for struct_def in structs {
+        for field in &struct_def.fields {
+            validate_declared_type_in_structs(&field.field_type, structs)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_declared_type(ty: &Type, program: &Program) -> Result<(), String> {
+    validate_declared_type_in_structs(ty, &program.structs)
+}
+
+fn validate_declared_type_in_structs(ty: &Type, structs: &[StructDef]) -> Result<(), String> {
+    match ty {
+        Type::Struct(name) => {
+            if structs.iter().any(|struct_def| struct_def.name == *name) {
+                Ok(())
+            } else {
+                Err(format!("未定义的结构 `{}`", name))
+            }
+        }
+        Type::Array { element_type, .. } => {
+            validate_declared_type_in_structs(element_type, structs)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn find_struct<'a>(program: &'a Program, name: &str) -> Option<&'a StructDef> {
+    program
+        .structs
+        .iter()
+        .find(|struct_def| struct_def.name == name)
+}
+
+fn validate_struct_literal(
+    name: &str,
+    fields: &[(String, Expr)],
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalInfo>,
+) -> Result<Type, String> {
+    let struct_def = find_struct(program, name).ok_or_else(|| {
+        format!(
+            "未定义的结构 `{}`\n  = 帮助: 请先在顶层写 `定义结构{}：...。。`。",
+            name, name
+        )
+    })?;
+    let mut seen = HashSet::new();
+    for (field_name, value) in fields {
+        if !seen.insert(field_name.clone()) {
+            return Err(format!("构造 `{}` 时字段 `{}` 重复赋值", name, field_name));
+        }
+        let field_def = struct_def
+            .fields
+            .iter()
+            .find(|field| field.name == *field_name)
+            .ok_or_else(|| format!("结构 `{}` 没有字段 `{}`", name, field_name))?;
+        let value_type = validate_expr(value, program, func, scoped_imports, locals)?;
+        if value_type != field_def.field_type {
+            return Err(format!(
+                "构造 `{}` 的字段 `{}` 类型不匹配\n  = 字段类型: {}\n  = 表达式类型: {}",
+                name,
+                field_name,
+                type_name(&field_def.field_type),
+                type_name(&value_type)
+            ));
+        }
+    }
+    for field in &struct_def.fields {
+        if !seen.contains(&field.name) {
+            return Err(format!("构造 `{}` 缺少字段 `{}`", name, field.name));
+        }
+    }
+    Ok(Type::Struct(name.to_string()))
+}
+
+fn validate_field_access(
+    base: &Expr,
+    field: &str,
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalInfo>,
+) -> Result<Type, String> {
+    let base_type = validate_expr(base, program, func, scoped_imports, locals)?;
+    let Type::Struct(struct_name) = base_type else {
+        return Err(format!(
+            "不能对 {} 类型使用字段访问\n  = 帮助: 字段访问形如 `结构变量->字段名`。",
+            type_name(&base_type)
+        ));
+    };
+    let struct_def = find_struct(program, &struct_name)
+        .ok_or_else(|| format!("未定义的结构 `{}`", struct_name))?;
+    struct_def
+        .fields
+        .iter()
+        .find(|candidate| candidate.name == field)
+        .map(|field_def| field_def.field_type.clone())
+        .ok_or_else(|| format!("结构 `{}` 没有字段 `{}`", struct_name, field))
+}
+
+fn validate_format_placeholder(
+    name: &str,
+    program: &Program,
+    func: &FunctionDef,
+    scoped_imports: &[ImportDecl],
+    locals: &HashMap<String, LocalInfo>,
+) -> Result<Type, String> {
+    if let Some((base, field)) = name.split_once("->") {
+        return validate_field_access(
+            &Expr::Ident(base.trim().to_string()),
+            field.trim(),
+            program,
+            func,
+            scoped_imports,
+            locals,
+        );
+    }
+    locals
+        .get(name)
+        .map(|local| local.ty.clone())
+        .ok_or_else(|| format!("未定义的格式化变量 `{}`\n  = 帮助: 格式化字符串 `{{...}}` 中只能引用当前作用域内已声明的变量。", name))
+}
+
 fn validate_expr(
     expr: &Expr,
     program: &Program,
@@ -564,6 +719,7 @@ fn validate_expr(
 ) -> Result<Type, String> {
     match expr {
         Expr::IntLiteral(_) => Ok(Type::Int),
+        Expr::DoubleLiteral(_) => Ok(Type::Double),
         Expr::Ident(name) => locals
             .get(name)
             .map(|local| local.ty.clone())
@@ -627,15 +783,16 @@ fn validate_expr(
         Expr::FormattedString(parts) => {
             for part in parts {
                 if let FormatPart::Placeholder(name) = part {
-                    locals
-                        .get(name)
-                        .ok_or_else(|| format!("未定义的格式化变量 `{}`\n  = 帮助: 格式化字符串 `{{...}}` 中只能引用当前作用域内已声明的变量。", name))?;
+                    validate_format_placeholder(name, program, func, scoped_imports, locals)?;
                 }
             }
             Ok(Type::String)
         }
         Expr::ArrayLiteral(elements) => {
             validate_array_literal(elements, program, func, scoped_imports, locals)
+        }
+        Expr::StructLiteral { name, fields } => {
+            validate_struct_literal(name, fields, program, func, scoped_imports, locals)
         }
         Expr::Index { array, index } => {
             if !matches!(array.as_ref(), Expr::Ident(_)) {
@@ -671,10 +828,14 @@ fn validate_expr(
                 )),
             }
         }
+        Expr::FieldAccess { base, field } => {
+            validate_field_access(base, field, program, func, scoped_imports, locals)
+        }
         Expr::Unary { op, expr } => {
             let ty = validate_expr(expr, program, func, scoped_imports, locals)?;
             match (op, ty) {
                 (UnaryOp::Neg, Type::Int) => Ok(Type::Int),
+                (UnaryOp::Neg, Type::Double) => Ok(Type::Double),
                 (UnaryOp::Not, Type::Int | Type::Bool) => Ok(Type::Bool),
                 (UnaryOp::Neg, other) => Err(format!("一元 `-` 不支持 {} 类型", type_name(&other))),
                 (UnaryOp::Not, other) => Err(format!("一元 `!` 不支持 {} 类型", type_name(&other))),
@@ -687,9 +848,11 @@ fn validate_expr(
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
                     if left_ty == Type::Int && right_ty == Type::Int {
                         Ok(Type::Int)
+                    } else if left_ty == Type::Double && right_ty == Type::Double {
+                        Ok(Type::Double)
                     } else {
                         Err(format!(
-                            "算术运算符 `{}` 需要整数操作数\n  = 左侧: {}\n  = 右侧: {}",
+                            "算术运算符 `{}` 需要同类型数字操作数\n  = 左侧: {}\n  = 右侧: {}",
                             binary_op_name(op),
                             type_name(&left_ty),
                             type_name(&right_ty)
@@ -709,11 +872,13 @@ fn validate_expr(
                     }
                 }
                 BinaryOp::Less | BinaryOp::LessEq | BinaryOp::Greater | BinaryOp::GreaterEq => {
-                    if left_ty == Type::Int && right_ty == Type::Int {
+                    if (left_ty == Type::Int && right_ty == Type::Int)
+                        || (left_ty == Type::Double && right_ty == Type::Double)
+                    {
                         Ok(Type::Bool)
                     } else {
                         Err(format!(
-                            "比较运算符 `{}` 需要整数操作数\n  = 左侧: {}\n  = 右侧: {}",
+                            "比较运算符 `{}` 需要同类型数字操作数\n  = 左侧: {}\n  = 右侧: {}",
                             binary_op_name(op),
                             type_name(&left_ty),
                             type_name(&right_ty)
@@ -945,6 +1110,7 @@ fn type_name(ty: &Type) -> String {
         Type::Bool => "布尔".to_string(),
         Type::Char => "字符".to_string(),
         Type::String => "字符串".to_string(),
+        Type::Struct(name) => format!("结构{}", name),
         Type::Array {
             element_type,
             length,
@@ -1208,6 +1374,28 @@ mod tests {
             .expect("Parse failed");
 
         analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_struct_literal_and_field_access() {
+        let source = "定义结构坐标：x：小数，y：小数，z：小数。。定义 方法 测试（）返回 小数：设 原点=构造坐标：x：0.0，y：1.0，z：2.0。。返回 原点->x。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        analyze(&program).expect("Semantic analysis failed");
+    }
+
+    #[test]
+    fn test_struct_literal_rejects_wrong_field_type() {
+        let source =
+            "定义结构坐标：x：小数。。定义 方法 测试（）返回 无：设 原点=构造坐标：x：1。。。。";
+        let program = Parser::new(Lexer::new(source))
+            .parse_program()
+            .expect("Parse failed");
+
+        let err = analyze(&program).expect_err("Semantic analysis should fail");
+        assert!(err.contains("字段 `x` 类型不匹配"));
     }
 
     #[test]

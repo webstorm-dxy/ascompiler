@@ -13,6 +13,7 @@ pub struct Program {
     pub has_entry: bool,
     pub modules: Vec<ModuleDef>,
     pub imports: Vec<ImportDecl>,
+    pub structs: Vec<StructDef>,
     pub functions: Vec<FunctionDef>,
 }
 
@@ -25,6 +26,18 @@ pub struct ModuleDef {
 pub struct ImportDecl {
     pub path: String,
     pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<StructField>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructField {
+    pub name: String,
+    pub field_type: Type,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,13 +164,22 @@ pub enum LoopStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLiteral(i64),
+    DoubleLiteral(f64),
     StringLiteral(String),
     FormattedString(Vec<FormatPart>),
     ArrayLiteral(Vec<Expr>),
+    StructLiteral {
+        name: String,
+        fields: Vec<(String, Expr)>,
+    },
     Ident(String),
     Index {
         array: Box<Expr>,
         index: Box<Expr>,
+    },
+    FieldAccess {
+        base: Box<Expr>,
+        field: String,
     },
     Call {
         target: String,
@@ -219,6 +241,7 @@ pub enum Type {
     Bool,
     Char,
     String,
+    Struct(String),
     Array {
         element_type: Box<Type>,
         length: Option<usize>,
@@ -371,6 +394,7 @@ impl Parser {
     pub fn parse_program(mut self) -> Result<Program, String> {
         let mut modules = Vec::new();
         let mut imports = Vec::new();
+        let mut structs = Vec::new();
         let mut functions = Vec::new();
 
         while self.current != Token::Eof {
@@ -387,8 +411,24 @@ impl Parser {
                     self.parse_declaration()?;
                 }
                 Token::Define => {
-                    let func = self.parse_function_def()?;
-                    functions.push(func);
+                    self.expect(&Token::Define)?;
+                    match &self.current {
+                        Token::Method => {
+                            let func = self.parse_function_def_after_define()?;
+                            functions.push(func);
+                        }
+                        Token::StructKw => {
+                            let struct_def = self.parse_struct_def_after_define()?;
+                            structs.push(struct_def);
+                        }
+                        Token::Error(message) => return Err(self.lexical_error(message)),
+                        other => {
+                            return Err(self.error(
+                                format!("`定义` 后期望 `方法` 或 `结构`，但找到了 `{}`", token_name(other)),
+                                "顶层可以写 `定义 方法 名称（...）返回 ...：...。。` 或 `定义结构名称：字段：类型。。`。",
+                            ));
+                        }
+                    }
                 }
                 Token::Error(message) => {
                     return Err(self.lexical_error(message));
@@ -406,6 +446,7 @@ impl Parser {
             has_entry: self.has_entry,
             modules,
             imports,
+            structs,
             functions,
         })
     }
@@ -489,9 +530,7 @@ impl Parser {
     /// Parse a function definition:
     /// `定义 方法 name (params) 返回 return_type : ... scope_end`
     /// or with Chinese punctuation variants.
-    fn parse_function_def(&mut self) -> Result<FunctionDef, String> {
-        self.expect(&Token::Define)?;
-
+    fn parse_function_def_after_define(&mut self) -> Result<FunctionDef, String> {
         // Expect definition type keyword: currently only 方法 is supported
         match &self.current {
             Token::Method => {
@@ -556,6 +595,29 @@ impl Parser {
         })
     }
 
+    fn parse_struct_def_after_define(&mut self) -> Result<StructDef, String> {
+        self.expect(&Token::StructKw)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::Colon)?;
+        let mut fields = Vec::new();
+
+        while self.current != Token::ScopeEnd && self.current != Token::Eof {
+            let field_name = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let field_type = self.parse_type()?;
+            fields.push(StructField {
+                name: field_name,
+                field_type,
+            });
+            if self.current == Token::Comma {
+                self.advance();
+            }
+        }
+
+        self.expect(&Token::ScopeEnd)?;
+        Ok(StructDef { name, fields })
+    }
+
     /// Parse comma-separated parameters: param (, param)*
     fn parse_params(&mut self) -> Result<Vec<Param>, String> {
         let mut params = Vec::new();
@@ -596,6 +658,11 @@ impl Parser {
                 Ok(t)
             }
             None => {
+                if let Token::Ident(name) = &self.current {
+                    let name = name.clone();
+                    self.advance();
+                    return Ok(Type::Struct(name));
+                }
                 if let Token::Error(message) = &self.current {
                     Err(self.lexical_error(message))
                 } else {
@@ -1106,30 +1173,56 @@ impl Parser {
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, String> {
-        let mut expr = self.parse_primary()?;
-        while self.current == Token::LBracket {
-            self.advance();
-            let index = self.parse_expr()?;
-            self.expect(&Token::RBracket)?;
-            expr = Expr::Index {
-                array: Box::new(expr),
-                index: Box::new(index),
-            };
+        let (mut expr, _) = self.parse_primary_with_span()?;
+        loop {
+            match self.current {
+                Token::LBracket => {
+                    self.advance();
+                    let index = self.parse_expr()?;
+                    self.expect(&Token::RBracket)?;
+                    expr = Expr::Index {
+                        array: Box::new(expr),
+                        index: Box::new(index),
+                    };
+                }
+                Token::Arrow => {
+                    self.advance();
+                    let Token::Ident(field) = &self.current else {
+                        return Err(self.error(
+                            "结构体字段访问 `->` 后必须接字段名",
+                            "字段访问形如 `原点->x`。",
+                        ));
+                    };
+                    let field = field.clone();
+                    self.advance();
+                    expr = Expr::FieldAccess {
+                        base: Box::new(expr),
+                        field,
+                    };
+                }
+                _ => break,
+            }
         }
         Ok(expr)
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, String> {
+    fn parse_primary_with_span(&mut self) -> Result<(Expr, usize), String> {
+        let start_span = self.current_span;
         match &self.current {
             Token::IntLiteral(val) => {
                 let val = *val;
                 self.advance();
-                Ok(Expr::IntLiteral(val))
+                Ok((Expr::IntLiteral(val), start_span.end))
+            }
+            Token::DoubleLiteral(val) => {
+                let val = *val;
+                self.advance();
+                Ok((Expr::DoubleLiteral(val), start_span.end))
             }
             Token::StringLiteral(val) => {
                 let val = val.clone();
                 self.advance();
-                Ok(Expr::StringLiteral(val))
+                Ok((Expr::StringLiteral(val), start_span.end))
             }
             Token::FormattedStringLiteral(val) => {
                 let parts = parse_format_parts(val).map_err(|msg| {
@@ -1139,9 +1232,16 @@ impl Parser {
                     )
                 })?;
                 self.advance();
-                Ok(Expr::FormattedString(parts))
+                Ok((Expr::FormattedString(parts), start_span.end))
             }
-            Token::LBracket => self.parse_array_literal(),
+            Token::LBracket => {
+                let expr = self.parse_array_literal()?;
+                Ok((expr, self.current_span.start))
+            }
+            Token::Construct => {
+                let expr = self.parse_struct_literal()?;
+                Ok((expr, self.current_span.start))
+            }
             Token::Ident(name) => {
                 let name = name.clone();
                 self.advance();
@@ -1158,22 +1258,27 @@ impl Parser {
                             break;
                         }
                     }
+                    let end = self.current_span.end;
                     self.expect(&Token::RParen)?;
-                    Ok(Expr::Call {
+                    Ok((Expr::Call {
                         target: name,
                         type_arg: None,
                         args,
-                    })
+                    }, end))
                 } else {
-                    Ok(Expr::Ident(name))
+                    Ok((Expr::Ident(name), start_span.end))
                 }
             }
-            Token::TakeValue => self.parse_take_value_expr(),
+            Token::TakeValue => {
+                let expr = self.parse_take_value_expr()?;
+                Ok((expr, self.current_span.start))
+            }
             Token::LParen => {
                 self.advance();
                 let expr = self.parse_expr()?;
+                let end = self.current_span.end;
                 self.expect(&Token::RParen)?;
-                Ok(expr)
+                Ok((expr, end))
             }
             Token::Error(message) => Err(self.lexical_error(message)),
             other => Err(self.error(
@@ -1198,6 +1303,26 @@ impl Parser {
         }
         self.expect(&Token::RBracket)?;
         Ok(Expr::ArrayLiteral(elements))
+    }
+
+    fn parse_struct_literal(&mut self) -> Result<Expr, String> {
+        self.expect(&Token::Construct)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::Colon)?;
+        let mut fields = Vec::new();
+
+        while self.current != Token::ScopeEnd && self.current != Token::Eof {
+            let field_name = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let value = self.parse_expr()?;
+            fields.push((field_name, value));
+            if self.current == Token::Comma {
+                self.advance();
+            }
+        }
+
+        self.expect(&Token::ScopeEnd)?;
+        Ok(Expr::StructLiteral { name, fields })
     }
 
     fn parse_take_value_expr(&mut self) -> Result<Expr, String> {
@@ -1263,6 +1388,8 @@ fn token_name(token: &Token) -> String {
         Token::Define => "定义".to_string(),
         Token::Method => "方法".to_string(),
         Token::Module => "模块".to_string(),
+        Token::StructKw => "结构".to_string(),
+        Token::Construct => "构造".to_string(),
         Token::ReturnKw => "返回".to_string(),
         Token::If => "判断".to_string(),
         Token::ElseIf => "若".to_string(),
@@ -1316,6 +1443,7 @@ fn token_name(token: &Token) -> String {
         Token::Arrow => "->".to_string(),
         Token::Ident(name) => format!("标识符 `{}`", name),
         Token::IntLiteral(value) => format!("整数 `{}`", value),
+        Token::DoubleLiteral(value) => format!("小数 `{}`", value),
         Token::StringLiteral(_) => "字符串字面量".to_string(),
         Token::FormattedStringLiteral(_) => "格式化字符串".to_string(),
         Token::Error(message) => format!("错误 token（{}）", message),
@@ -1790,6 +1918,66 @@ mod tests {
                 );
             }
             other => panic!("Expected Execute, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_struct_definition_and_literal() {
+        let source = "定义结构坐标：x：小数，y：小数，z：小数。。定义 方法 测试（）返回 无：设 原点=构造坐标：x：0.0，y：0.0，z：0.0。。执行输出：f“x：{原点->x}”。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        assert_eq!(program.structs.len(), 1);
+        assert_eq!(program.structs[0].name, "坐标");
+        assert_eq!(program.structs[0].fields.len(), 3);
+        let func = &program.functions[0];
+        match &func.body[0] {
+            Stmt::VarDecl(var) => {
+                assert_eq!(var.name, "原点");
+                assert_eq!(
+                    var.init,
+                    Some(Expr::StructLiteral {
+                        name: "坐标".to_string(),
+                        fields: vec![
+                            ("x".to_string(), Expr::DoubleLiteral(0.0)),
+                            ("y".to_string(), Expr::DoubleLiteral(0.0)),
+                            ("z".to_string(), Expr::DoubleLiteral(0.0)),
+                        ],
+                    })
+                );
+            }
+            other => panic!("Expected VarDecl, found {:?}", other),
+        }
+        match &func.body[1] {
+            Stmt::Execute(exec) => assert_eq!(
+                exec.args,
+                vec![Expr::FormattedString(vec![
+                    FormatPart::Text("x：".to_string()),
+                    FormatPart::Placeholder("原点->x".to_string()),
+                ])]
+            ),
+            other => panic!("Expected Execute, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_struct_field_access_expression() {
+        let source = "定义 方法 测试（）返回 无：设 x=原点->x。。";
+        let lexer = Lexer::new(source);
+        let parser = Parser::new(lexer);
+        let program = parser.parse_program().expect("Parse failed");
+
+        let func = &program.functions[0];
+        match &func.body[0] {
+            Stmt::VarDecl(var) => assert_eq!(
+                var.init,
+                Some(Expr::FieldAccess {
+                    base: Box::new(Expr::Ident("原点".to_string())),
+                    field: "x".to_string(),
+                })
+            ),
+            other => panic!("Expected VarDecl, found {:?}", other),
         }
     }
 
