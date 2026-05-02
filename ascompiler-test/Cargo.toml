@@ -1,0 +1,8 @@
+[package]
+name = "ascompiler-test"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ascompiler.workspace = true
+inkwell.workspace = true

@@ -10,10 +10,11 @@ This repository is a Cargo workspace for the Chinese-language “问源” compi
 - `ascompiler/src/parser.rs` defines the AST and parser.
 - `ascompiler/src/semantic.rs` validates modules, imports, and callable resolution.
 - `ascompiler/src/codegen.rs` emits LLVM IR through `inkwell`.
+- `ascompiler-test/src/` contains the compiler test suite split by pipeline stage.
 - `salt/src/main.rs` implements the Salt package manager/toolchain for creating, building, and running 问源 projects.
 - `wenyuan-ffi` and `wenyuan-ffi-macros` provide Rust FFI support.
 
-Unit tests are colocated in each Rust module under `#[cfg(test)]`. Sample source programs live in `demo/`. Build output is generated under `target/` and should not be edited.
+Compiler unit tests live in the separate `ascompiler-test` crate. Sample source programs live in `demo/`. Build output is generated under `target/` and should not be edited.
 
 ## Build, Test, and Development Commands
 
@@ -49,7 +50,7 @@ When updating compiler behavior, update the Salt toolchain code at the same time
 
 ## Testing Guidelines
 
-Use Rust’s built-in test framework. Add focused tests near the module being changed, for example lexer token tests in `ascompiler/src/lexer.rs` and parser AST tests in `ascompiler/src/parser.rs`. Test names should describe behavior, such as `test_parse_module_import_and_execute`.
+Use Rust’s built-in test framework. Add focused compiler tests to the matching file under `ascompiler-test/src/`, for example lexer token tests in `ascompiler-test/src/lexer.rs` and parser AST tests in `ascompiler-test/src/parser.rs`. Test names should describe behavior, such as `test_parse_module_import_and_execute`.
 
 Run `cargo test --workspace` before submitting changes. For codegen behavior, also compile and run a small `.as` program when practical.
 

@@ -16,6 +16,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ascompiler-test"
+version = "0.1.0"
+dependencies = [
+ "ascompiler",
+ "inkwell",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"

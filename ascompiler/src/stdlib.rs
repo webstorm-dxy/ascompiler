@@ -60,27 +60,3 @@ fn prepend_program(program: &mut Program, mut prefix: Program) {
     prefix.functions.append(&mut program.functions);
     *program = prefix;
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::semantic;
-
-    #[test]
-    fn test_standard_library_exports_output() {
-        let program = parse_standard_library().expect("std parse failed");
-        assert!(program.modules.iter().any(|m| m.name == "标准库-输入输出"));
-        assert!(
-            program
-                .functions
-                .iter()
-                .any(|f| semantic::function_path(f) == STD_IO_OUTPUT_PATH && f.is_external)
-        );
-        assert!(
-            program
-                .functions
-                .iter()
-                .any(|f| semantic::function_path(f) == STD_IO_INPUT_PATH && f.is_external)
-        );
-    }
-}
