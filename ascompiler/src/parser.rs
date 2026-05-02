@@ -201,6 +201,7 @@ pub enum LoopStmt {
 pub enum Expr {
     IntLiteral(i64),
     DoubleLiteral(f64),
+    BoolLiteral(bool),
     StringLiteral(String),
     FormattedString(Vec<FormatPart>),
     ArrayLiteral(Vec<Expr>),
@@ -1485,6 +1486,11 @@ impl Parser {
                 self.advance();
                 Ok((Expr::DoubleLiteral(val), start_span.end))
             }
+            Token::BoolLiteral(val) => {
+                let val = *val;
+                self.advance();
+                Ok((Expr::BoolLiteral(val), start_span.end))
+            }
             Token::StringLiteral(val) => {
                 let val = val.clone();
                 self.advance();
@@ -1736,6 +1742,8 @@ fn token_name(token: &Token) -> String {
         Token::Ident(name) => format!("标识符 `{}`", name),
         Token::IntLiteral(value) => format!("整数 `{}`", value),
         Token::DoubleLiteral(value) => format!("小数 `{}`", value),
+        Token::BoolLiteral(true) => "真".to_string(),
+        Token::BoolLiteral(false) => "假".to_string(),
         Token::StringLiteral(_) => "字符串字面量".to_string(),
         Token::FormattedStringLiteral(_) => "格式化字符串".to_string(),
         Token::Error(message) => format!("错误 token（{}）", message),

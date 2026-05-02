@@ -990,6 +990,7 @@ fn validate_expr(
     match expr {
         Expr::IntLiteral(_) => Ok(Type::Int),
         Expr::DoubleLiteral(_) => Ok(Type::Double),
+        Expr::BoolLiteral(_) => Ok(Type::Bool),
         Expr::Ident(name) => locals
             .get(name)
             .map(|local| local.ty.clone())
@@ -1215,17 +1216,19 @@ fn validate_array_literal(
             "数组字面量不能为空\n  = 帮助: 请至少提供一个元素，例如 `【1，2，3】`。".to_string(),
         );
     }
-    for element in elements {
+    let first_type = validate_expr(&elements[0], program, func, scoped_imports, locals)?;
+    for element in &elements[1..] {
         let element_type = validate_expr(element, program, func, scoped_imports, locals)?;
-        if element_type != Type::Int {
+        if element_type != first_type {
             return Err(format!(
-                "数组元素类型不匹配\n  = 期望: 整数\n  = 实际: {}\n  = 帮助: 当前数组先支持整数元素。",
+                "数组元素类型不一致\n  = 第一个元素: {}\n  = 当前元素: {}\n  = 帮助: 数组中所有元素必须类型相同。",
+                type_name(&first_type),
                 type_name(&element_type)
             ));
         }
     }
     Ok(Type::Array {
-        element_type: Box::new(Type::Int),
+        element_type: Box::new(first_type),
         length: Some(elements.len()),
     })
 }
@@ -1234,15 +1237,15 @@ fn resolve_declared_type(declared: &Type, inferred: &Type) -> Option<Type> {
     match (declared, inferred) {
         (
             Type::Array {
-                element_type: declared_element,
                 length: None,
+                ..
             },
             Type::Array {
                 element_type: inferred_element,
                 length: Some(length),
             },
-        ) if declared_element == inferred_element => Some(Type::Array {
-            element_type: declared_element.clone(),
+        ) => Some(Type::Array {
+            element_type: inferred_element.clone(),
             length: Some(*length),
         }),
         _ if declared == inferred => Some(declared.clone()),

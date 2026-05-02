@@ -1320,6 +1320,8 @@ fn compile_expr<'ctx>(
     match expr {
         Expr::IntLiteral(val) => Ok(context.i32_type().const_int(*val as u64, true).into()),
         Expr::DoubleLiteral(val) => Ok(context.f64_type().const_float(*val).into()),
+        Expr::BoolLiteral(true) => Ok(context.bool_type().const_int(1, false).into()),
+        Expr::BoolLiteral(false) => Ok(context.bool_type().const_int(0, false).into()),
         Expr::Ident(name) => {
             let local = locals
                 .get(name)
@@ -1871,6 +1873,7 @@ fn infer_type_from_expr<'ctx>(
     match expr {
         Expr::IntLiteral(_) => Ok(Type::Int),
         Expr::DoubleLiteral(_) => Ok(Type::Double),
+        Expr::BoolLiteral(_) => Ok(Type::Bool),
         Expr::Ident(name) => locals
             .get(name)
             .map(local_type)
@@ -1902,18 +1905,21 @@ fn infer_type_from_expr<'ctx>(
             if elements.is_empty() {
                 return Err("数组字面量不能为空".to_string());
             }
-            for element in elements {
+            let first_type =
+                infer_type_from_expr(&elements[0], current_func, program, scoped_imports, locals)?;
+            for element in &elements[1..] {
                 let element_type =
                     infer_type_from_expr(element, current_func, program, scoped_imports, locals)?;
-                if element_type != Type::Int {
+                if element_type != first_type {
                     return Err(format!(
-                        "数组元素暂只支持整数，实际为 {}",
+                        "数组元素类型不一致\n  = 第一个元素: {}\n  = 当前元素: {}",
+                        type_name(&first_type),
                         type_name(&element_type)
                     ));
                 }
             }
             Ok(Type::Array {
-                element_type: Box::new(Type::Int),
+                element_type: Box::new(first_type),
                 length: Some(elements.len()),
             })
         }
@@ -2060,15 +2066,15 @@ fn resolve_declared_type(declared: &Type, inferred: &Type) -> Option<Type> {
     match (declared, inferred) {
         (
             Type::Array {
-                element_type: declared_element,
                 length: None,
+                ..
             },
             Type::Array {
                 element_type: inferred_element,
                 length: Some(length),
             },
-        ) if declared_element == inferred_element => Some(Type::Array {
-            element_type: declared_element.clone(),
+        ) => Some(Type::Array {
+            element_type: inferred_element.clone(),
             length: Some(*length),
         }),
         _ if declared == inferred => Some(declared.clone()),
@@ -2093,7 +2099,10 @@ fn compile_array_literal<'ctx>(
     if elements.is_empty() {
         return Err("数组字面量不能为空".to_string());
     }
-    let array_type = context.i32_type().array_type(elements.len() as u32);
+    let element_type =
+        infer_type_from_expr(&elements[0], current_func, program, scoped_imports, locals)?;
+    let element_llvm_type = as_llvm_type(&element_type, context, program)?;
+    let array_type = element_llvm_type.array_type(elements.len() as u32);
     let mut array_value = array_type.const_zero();
     for (index, element) in elements.iter().enumerate() {
         let value = compile_expr(
@@ -2548,6 +2557,15 @@ fn compile_formatted_string<'ctx>(
                 match ty {
                     Type::Int => format.push_str("%d"),
                     Type::Double => format.push_str("%g"),
+                    Type::Bool => {
+                        format.push_str("%d");
+                        let int_val = value.into_int_value();
+                        let extended = builder
+                            .build_int_z_extend(int_val, context.i32_type(), "bool.fmt.ext")
+                            .map_err(|e| format!("build_int_z_extend failed: {:?}", e))?;
+                        args.push(extended.into());
+                        continue;
+                    }
                     Type::String => format.push_str("%s"),
                     other => {
                         return Err(format!(

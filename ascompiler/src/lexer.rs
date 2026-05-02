@@ -85,6 +85,7 @@ pub enum Token {
     Ident(String),
     IntLiteral(i64),
     DoubleLiteral(f64),
+    BoolLiteral(bool),
     StringLiteral(String),
     FormattedStringLiteral(String),
 
@@ -282,6 +283,14 @@ impl Lexer {
             self.advance();
             return Some(Token::OrOr);
         }
+        if ch1 == '真' {
+            self.advance();
+            return Some(Token::BoolLiteral(true));
+        }
+        if ch1 == '假' {
+            self.advance();
+            return Some(Token::BoolLiteral(false));
+        }
 
         None
     }
@@ -358,6 +367,8 @@ impl Lexer {
             || ch1 == '取'
             || ch1 == '且'
             || ch1 == '或'
+            || ch1 == '真'
+            || ch1 == '假'
     }
 
     /// Read an integer or decimal literal starting at the current position.
